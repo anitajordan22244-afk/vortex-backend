@@ -6,6 +6,9 @@ import { IntentsGateway } from "./intents.gateway";
 import { IntentsSweeperService } from "./intents-sweeper.service";
 import { INTENTS_REPOSITORY, InMemoryIntentsRepository } from "./intents.repository";
 import { PrismaIntentsRepository } from "./prisma-intents.repository";
+import { DualWriteIntentsRepository } from "./dual-write-intents.repository";
+import { IntentsStoreVerifierService } from "./intents-store-verifier.service";
+import { MetricsService } from "../metrics/metrics.service";
 import { SolversModule } from "../solvers/solvers.module";
 import { RoutingModule } from "../routing/routing.module";
 import { TokensModule } from "../tokens/tokens.module";
@@ -15,26 +18,40 @@ import { AppConfig } from "../config/configuration";
 import { PrismaService } from "../prisma/prisma.service";
 
 @Module({
-  imports: [forwardRef(() => SolversModule), RoutingModule, TokensModule, SorobanModule],
+  imports: [forwardRef(() => SolversModule), RoutingModule, TokensModule, forwardRef(() => SorobanModule)],
   controllers: [IntentsController],
   providers: [
-    // Select the persistence adapter based on INTENTS_PERSISTENCE env var.
-    // INTENTS_PERSISTENCE=prisma  → PrismaIntentsRepository (production/staging)
-    // INTENTS_PERSISTENCE=memory  → InMemoryIntentsRepository (default, dev/test)
+    // Select the intents store from INTENTS_STORE (issue #404):
+    //   memory   → InMemoryIntentsRepository (default, dev/test)
+    //   dual     → DualWriteIntentsRepository (memory reads, Postgres mirror)
+    //   postgres → PrismaIntentsRepository (production)
+    // See docs/runbooks/intents-store-migration.md for the cut-over steps.
     {
       provide: INTENTS_REPOSITORY,
-      inject: [ConfigService, PrismaService],
-      useFactory: (config: ConfigService<AppConfig, true>, prisma: PrismaService) => {
-        const adapter = process.env.INTENTS_PERSISTENCE ?? "memory";
-        if (adapter === "prisma") {
-          return new PrismaIntentsRepository(prisma);
+      inject: [ConfigService, PrismaService, { token: MetricsService, optional: true }],
+      useFactory: (
+        config: ConfigService<AppConfig, true>,
+        prisma: PrismaService,
+        metrics?: MetricsService,
+      ) => {
+        switch (config.get("intentsStore", { infer: true })) {
+          case "postgres":
+            return new PrismaIntentsRepository(prisma);
+          case "dual":
+            return new DualWriteIntentsRepository(
+              new InMemoryIntentsRepository({ seed: false }),
+              new PrismaIntentsRepository(prisma),
+              metrics,
+            );
+          default:
+            return new InMemoryIntentsRepository();
         }
-        return new InMemoryIntentsRepository();
       },
     },
     IntentsService,
     IntentsGateway,
     IntentsSweeperService,
+    IntentsStoreVerifierService,
     EventIngestionService,
   ],
   exports: [IntentsService, IntentsGateway],

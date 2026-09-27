@@ -39,6 +39,9 @@ export const envValidationSchema = Joi.object({
     }),
 
   ONCHAIN_INTENTS_ENABLED: Joi.boolean().default(false),
+  // Retention for terminal intents evicted from the in-memory store.
+  INTENT_RETENTION_DAYS: Joi.number().integer().min(0).default(30),
+  INTENT_RETENTION_SWEEP_MS: Joi.number().integer().min(1000).default(60000),
   CORS_ORIGIN: Joi.string().default("*"),
   WS_MAX_CONNECTIONS: Joi.number().integer().min(0).default(1000),
   SOROBAN_FEE_PERCENTILE: Joi.string()
@@ -64,10 +67,19 @@ export const envValidationSchema = Joi.object({
   REDIS_URL: Joi.string().uri({ scheme: ["redis", "rediss"] }).default("redis://localhost:6379"),
 
   // ── Persistence adapter selection ─────────────────────────────────────────
-  // Controls which repository adapter is used for intents and solvers.
-  // "memory" (default) keeps everything in-process — no database required.
-  // "prisma" writes to PostgreSQL via Prisma — requires DATABASE_URL to point
-  // to a live database.  Intended for production / staging.
+  // INTENTS_STORE selects the intents backend (issue #404):
+  //   "memory"   — in-process only, no database required (dev/test default)
+  //   "dual"     — writes go to both stores, reads come from memory, and a
+  //                consistency verifier reports mismatches (migration phase)
+  //   "postgres" — PostgreSQL via Prisma is the only store (production)
+  // No schema default: when unset, configuration.ts falls back to the
+  // deprecated INTENTS_PERSISTENCE alias ("prisma" → "postgres").
+  // See docs/runbooks/intents-store-migration.md for the cut-over procedure.
+  INTENTS_STORE: Joi.string().valid("memory", "dual", "postgres"),
+  // Interval (ms) between dual-write consistency verifier runs.
+  INTENTS_VERIFY_INTERVAL_MS: Joi.number().integer().min(1000).default(60000),
+  // Deprecated alias for INTENTS_STORE, kept for existing deployments.
+  // SOLVERS_PERSISTENCE still selects the solvers adapter ("memory" | "prisma").
   INTENTS_PERSISTENCE: Joi.string().valid("memory", "prisma").default("memory"),
   SOLVERS_PERSISTENCE: Joi.string().valid("memory", "prisma").default("memory"),
 
@@ -133,4 +145,11 @@ export const envValidationSchema = Joi.object({
       }),
       otherwise: Joi.boolean().default(true),
     }),
+
+  // ── Reference solver bot (scripts/solver-bot.ts) ─────────────────────────
+  // Not read by the server; validated here so .env files shared with the bot
+  // pass the drift check. See .env.example.
+  SOLVER_SECRET: Joi.string().allow("").optional(),
+  SOLVER_ADDRESS: Joi.string().allow("").optional(),
+  SOLVER_CHAINS: Joi.string().allow("").optional(),
 });

@@ -22,6 +22,12 @@ export class MetricsService implements OnModuleInit {
   public readonly sweeperExpiredTotal: client.Counter<string>;
   public readonly sweeperSweepDurationMs: client.Histogram<string>;
 
+  /** Dual-write / consistency-verifier metrics (issue #404). */
+  public readonly intentsDualWriteFailuresTotal: client.Counter<string>;
+  public readonly intentsStoreMismatches: client.Gauge<string>;
+  public readonly intentsStoreMismatchesTotal: client.Counter<string>;
+  public readonly intentsStoreVerifierRunsTotal: client.Counter<string>;
+
   constructor(private readonly configService: ConfigService<AppConfig, true>) {
     this.register = new client.Registry();
     const prefix = "vortex_";
@@ -79,6 +85,34 @@ export class MetricsService implements OnModuleInit {
       buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
       registers: [this.register],
     });
+
+    // ── Intents store migration metrics (issue #404) ─────────────────────────
+    this.intentsDualWriteFailuresTotal = new client.Counter({
+      name: `${prefix}intents_dual_write_failures_total`,
+      help: "Postgres mirror writes that failed while INTENTS_STORE=dual",
+      labelNames: ["operation"],
+      registers: [this.register],
+    });
+
+    this.intentsStoreMismatches = new client.Gauge({
+      name: `${prefix}intents_store_mismatches`,
+      help: "Mismatches between the memory and Postgres intent stores found by the last verifier run",
+      labelNames: ["kind"],
+      registers: [this.register],
+    });
+
+    this.intentsStoreMismatchesTotal = new client.Counter({
+      name: `${prefix}intents_store_mismatches_total`,
+      help: "Cumulative mismatches found by the dual-write consistency verifier",
+      labelNames: ["kind"],
+      registers: [this.register],
+    });
+
+    this.intentsStoreVerifierRunsTotal = new client.Counter({
+      name: `${prefix}intents_store_verifier_runs_total`,
+      help: "Completed dual-write consistency verifier runs",
+      registers: [this.register],
+    });
   }
 
   onModuleInit() {
@@ -113,5 +147,19 @@ export class MetricsService implements OnModuleInit {
   recordSweep(expiredCount: number, durationMs: number): void {
     this.sweeperExpiredTotal.inc(expiredCount);
     this.sweeperSweepDurationMs.observe(durationMs);
+  }
+
+  /** Count a Postgres mirror write that failed in dual-write mode. */
+  recordDualWriteFailure(operation: string): void {
+    this.intentsDualWriteFailuresTotal.inc({ operation });
+  }
+
+  /** Publish one consistency-verifier run's mismatch counts, keyed by kind. */
+  recordStoreVerification(mismatches: Record<string, number>): void {
+    this.intentsStoreVerifierRunsTotal.inc();
+    for (const [kind, count] of Object.entries(mismatches)) {
+      this.intentsStoreMismatches.set({ kind }, count);
+      if (count > 0) this.intentsStoreMismatchesTotal.inc({ kind }, count);
+    }
   }
 }

@@ -6,12 +6,15 @@ import {
   ForbiddenException,
   Get,
   GoneException,
+  Headers,
   NotFoundException,
   Param,
   Post,
   Query,
+  Res,
   UseGuards,
 } from "@nestjs/common";
+import type { Response } from "express";
 import {
   ApiTags,
   ApiOkResponse,
@@ -22,6 +25,8 @@ import {
   ApiBadRequestResponse,
   ApiTooManyRequestsResponse,
   ApiOperation,
+  ApiHeader,
+  ApiPreconditionFailedResponse,
 } from "@nestjs/swagger";
 import { Throttle } from "@nestjs/throttler";
 import { IntentsService } from "./intents.service";
@@ -53,7 +58,21 @@ import {
   toDecimalNumber,
   varianceScaleFromPerfScore,
 } from "../common/amount";
-import { SupportedChain } from "./intents.types";
+import { Intent, SupportedChain } from "./intents.types";
+import { isVersionConflict, MutationResult, VersionConflict } from "./intents.repository";
+import { etagFor, parseIfMatch, preconditionFailed } from "./etag";
+
+/** Swagger docs shared by every endpoint that honours If-Match (issue #405). */
+const IF_MATCH_HEADER = {
+  name: "If-Match",
+  required: false,
+  description:
+    'Optional ETag from GET /api/v1/intents/:id (e.g. "3"). When supplied, the ' +
+    "mutation only applies if the intent is still at that version; otherwise 412.",
+};
+const ETAG_RESPONSE_HEADER = {
+  ETag: { description: "Current intent version as a strong entity tag, e.g. \"3\"", schema: { type: "string" } },
+};
 
 @ApiTags("intents")
 @Controller("api/v1/intents")
@@ -115,10 +134,12 @@ export class IntentsController {
   }
 
   @Get(":id")
+  @ApiOkResponse({ description: "The intent", headers: ETAG_RESPONSE_HEADER })
   @ApiNotFoundResponse({ description: "Intent not found" })
-  async getOne(@Param("id") id: string) {
+  async getOne(@Param("id") id: string, @Res({ passthrough: true }) res: Response) {
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
+    res.setHeader("ETag", etagFor(intent));
     return intent;
   }
 
@@ -186,8 +207,8 @@ export class IntentsController {
   @Get(":id/quote")
   @ApiOkResponse({ description: "Persisted quote for the intent" })
   @ApiNotFoundResponse({ description: "Intent not found or no quote persisted" })
-  getPersistedQuote(@Param("id") id: string) {
-    const intent = this.intentsService.get(id);
+  async getPersistedQuote(@Param("id") id: string) {
+    const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
     if (!intent.quotedDstAmount) throw new NotFoundException("No quote persisted for this intent");
     return { intentId: id, quotedDstAmount: intent.quotedDstAmount };
@@ -213,11 +234,11 @@ export class IntentsController {
     // #219: use typed resolveToken instead of ad-hoc duck-typed any casts.
     // #276: reject unrecognised tokens outright instead of silently creating an
     // intent whose priceUSD defaults to undefined.
-    const srcToken = this.tokensService.resolveSrcTokenOrThrow(
+    const srcToken = await this.tokensService.resolveSrcTokenOrThrow(
       dto.srcChain as SupportedChain,
       dto.srcTokenAddress,
     );
-    const dstToken = this.tokensService.resolveDstTokenOrThrow(dto.dstTokenContract);
+    const dstToken = await this.tokensService.resolveDstTokenOrThrow(dto.dstTokenContract);
 
     const intent = await this.intentsService.create(
       {
@@ -276,17 +297,28 @@ export class IntentsController {
   }
 
   @Post(":id/accept")
+  @ApiHeader(IF_MATCH_HEADER)
+  @ApiOkResponse({ description: "The accepted intent", headers: ETAG_RESPONSE_HEADER })
   @ApiNotFoundResponse({ description: "Intent not found" })
   @ApiConflictResponse({ description: "Intent is not in open state" })
+  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
   @ApiGoneResponse({ description: "Intent has expired" })
   @ApiForbiddenResponse({ description: "Solver not registered or inactive" })
-  async accept(@Param("id") id: string, @Body() dto: AcceptIntentDto) {
+  async accept(
+    @Param("id") id: string,
+    @Body() dto: AcceptIntentDto,
+    @Headers("if-match") ifMatch: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
 
     const now = Math.floor(Date.now() / 1000);
     if (intent.deadline <= now) {
-      await this.intentsService.update(id, { state: "expired" });
+      // Only an intent that is still open can lapse to expired here; the
+      // conditional write leaves any concurrent transition untouched.
+      await this.intentsService.expireIfOpen(id);
       throw new GoneException("Intent has expired");
     }
 
@@ -304,11 +336,12 @@ export class IntentsController {
     // Verify the solver controls the claimed address (mirrors fill()/cancel()).
     verifyStellarSignature(dto.solver, buildAcceptMessage(id, dto.solver), dto.signature);
 
-    const updated = await this.intentsService.acceptIfOpen(id, dto.solver);
+    const updated = this.unwrap(await this.intentsService.acceptIfOpen(id, dto.solver, expectedVersion));
     if (!updated) {
       const current = await this.intentsService.get(id);
       throw new ConflictException(`Intent is ${current?.state ?? "unknown"}, cannot accept`);
     }
+    res.setHeader("ETag", etagFor(updated));
 
     this.intentsGateway.broadcast({
       type: "intent_accepted",
@@ -319,12 +352,21 @@ export class IntentsController {
   }
 
   @Post(":id/fill")
+  @ApiHeader(IF_MATCH_HEADER)
+  @ApiOkResponse({ description: "The filled intent", headers: ETAG_RESPONSE_HEADER })
+  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
   @ApiNotFoundResponse({ description: "Intent not found" })
   @ApiConflictResponse({ description: "Intent is not in accepted state" })
   @ApiForbiddenResponse({ description: "Wrong solver for this intent" })
   @ApiGoneResponse({ description: "Fill window has expired" })
   @ApiBadRequestResponse({ description: "Fill amount below minimum" })
-  async fill(@Param("id") id: string, @Body() dto: FillIntentDto) {
+  async fill(
+    @Param("id") id: string,
+    @Body() dto: FillIntentDto,
+    @Headers("if-match") ifMatch: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
 
@@ -357,12 +399,19 @@ export class IntentsController {
 
     const feeAmount = (BigInt(dto.fillAmount) * 5n) / 10000n;
 
-    const updated = await this.intentsService.fillIfAccepted(id, dto.solver, {
-      filledAt: now,
-      fillAmount: dto.fillAmount,
-      feeAmount: feeAmount.toString(),
-      txHash: dto.txHash,
-    });
+    const updated = this.unwrap(
+      await this.intentsService.fillIfAccepted(
+        id,
+        dto.solver,
+        {
+          filledAt: now,
+          fillAmount: dto.fillAmount,
+          feeAmount: feeAmount.toString(),
+          txHash: dto.txHash,
+        },
+        expectedVersion,
+      ),
+    );
     if (!updated) {
       const current = await this.intentsService.get(id);
       if (current?.solver !== dto.solver) {
@@ -371,6 +420,7 @@ export class IntentsController {
       throw new ConflictException(`Intent is ${current?.state ?? "unknown"}, cannot fill`);
     }
 
+    res.setHeader("ETag", etagFor(updated));
     await this.solversService.recordSuccessfulFill(dto.solver);
 
     this.intentsGateway.broadcast({
@@ -383,10 +433,19 @@ export class IntentsController {
   }
 
   @Post(":id/cancel")
+  @ApiHeader(IF_MATCH_HEADER)
+  @ApiOkResponse({ description: "The cancelled intent", headers: ETAG_RESPONSE_HEADER })
   @ApiNotFoundResponse({ description: "Intent not found" })
   @ApiForbiddenResponse({ description: "Unauthorized" })
   @ApiConflictResponse({ description: "Intent is not in open state" })
-  async cancel(@Param("id") id: string, @Body() dto: CancelIntentDto) {
+  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
+  async cancel(
+    @Param("id") id: string,
+    @Body() dto: CancelIntentDto,
+    @Headers("if-match") ifMatch: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
     if (intent.user.toLowerCase() !== dto.user.toLowerCase()) {
@@ -399,11 +458,12 @@ export class IntentsController {
     // Verify the user controls the claimed address
     verifyStellarSignature(dto.user, buildCancelMessage(id), dto.signature);
 
-    const updated = await this.intentsService.cancelIfOpen(id);
+    const updated = this.unwrap(await this.intentsService.cancelIfOpen(id, expectedVersion));
     if (!updated) {
       const current = await this.intentsService.get(id);
       throw new ConflictException(`Cannot cancel intent in state: ${current?.state ?? "unknown"}`);
     }
+    res.setHeader("ETag", etagFor(updated));
 
     // Audit trail (issue #217 / #62): record who cancelled and when.
     this.intentsService.appendAuditEntry(id, "cancelled", dto.user, "user cancelled");
@@ -430,11 +490,13 @@ export class IntentsController {
     // when a token identifier IS supplied it must resolve — otherwise the quote
     // engine would silently substitute a fake $1 price.
     const srcToken = dto.srcTokenAddress
-      ? this.tokensService.resolveSrcTokenOrThrow(dto.srcChain as SupportedChain, dto.srcTokenAddress)
+      ? await this.tokensService.resolveSrcTokenOrThrow(dto.srcChain as SupportedChain, dto.srcTokenAddress)
       : undefined;
     const dstToken = dto.dstTokenContract
-      ? this.tokensService.resolveDstTokenOrThrow(dto.dstTokenContract)
+      ? await this.tokensService.resolveDstTokenOrThrow(dto.dstTokenContract)
       : undefined;
+
+    const targetIntent = dto.intentId ? await this.intentsService.get(dto.intentId) : undefined;
 
     const srcAmountBigInt = parseBaseUnits(dto.srcAmount);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -505,8 +567,11 @@ export class IntentsController {
       })
       .sort((a, b) => Number(BigInt(b.dstAmount) - BigInt(a.dstAmount)));
 
-    if (dto.intentId && targetIntent && quotes.length > 0) {
-      await this.intentsService.update(dto.intentId, { quotedDstAmount: quotes[0].dstAmount });
+    if (targetIntent && quotes.length > 0) {
+      // Persisting the best quote is safe to retry on a version conflict.
+      await this.intentsService.mutateWithRetry(targetIntent.intentId, (current) =>
+        this.intentsService.update(current.intentId, { quotedDstAmount: quotes[0].dstAmount }, current.version),
+      );
     }
 
     const best = quotes[0] ?? null;
@@ -537,18 +602,28 @@ export class IntentsController {
     description: "Rate limit exceeded — max 20 quote requests per 60 s per IP",
   })
   @ApiOkResponse({ type: QuoteResponseDto })
+  @ApiHeader(IF_MATCH_HEADER)
   @ApiNotFoundResponse({ description: "Intent not found" })
   @ApiConflictResponse({ description: "Intent is not in the open state" })
-  async requote(@Param("id") id: string): Promise<QuoteResponseDto> {
+  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
+  async requote(
+    @Param("id") id: string,
+    @Headers("if-match") ifMatch: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<QuoteResponseDto> {
+    const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
+    if (expectedVersion !== undefined && intent.version !== expectedVersion) {
+      throw preconditionFailed(new VersionConflict(id, expectedVersion, intent.version));
+    }
     if (intent.state !== "open") {
       throw new ConflictException(
         `Cannot requote intent in state "${intent.state}"; only open intents can be requoted`,
       );
     }
 
-    const solvers = this.solversService.getAll().filter((s) => s.isActive);
+    const solvers = (await this.solversService.getAll()).filter((s) => s.isActive);
     const srcToken = intent.srcToken;
     const dstToken = intent.dstToken;
     const srcAmountBigInt = BigInt(intent.srcAmount);
@@ -608,7 +683,18 @@ export class IntentsController {
       .sort((a, b) => Number(BigInt(b.dstAmount) - BigInt(a.dstAmount)));
 
     if (quotes.length > 0) {
-      await this.intentsService.update(id, { quotedDstAmount: quotes[0].dstAmount });
+      // Pin the write to the version the quote was computed from: a
+      // concurrent change surfaces as 412 (If-Match given) or 409 (not).
+      const updated = await this.intentsService.update(
+        id,
+        { quotedDstAmount: quotes[0].dstAmount },
+        expectedVersion ?? intent.version,
+      );
+      if (isVersionConflict(updated)) {
+        if (expectedVersion !== undefined) throw preconditionFailed(updated);
+        throw new ConflictException("Intent was modified concurrently; retry the requote");
+      }
+      if (updated) res.setHeader("ETag", etagFor(updated));
     }
 
     const best = quotes[0] ?? null;
@@ -623,5 +709,15 @@ export class IntentsController {
       totalFeesUSD: best?.totalFeesUSD ?? 0,
       priceImpact: best?.priceImpact ?? 0,
     };
+  }
+
+  /**
+   * Translate a repository MutationResult for HTTP: a VersionConflict can
+   * only arise when the client sent If-Match, so it becomes 412; `null`
+   * (state guard failed / not found) is returned for the caller to map.
+   */
+  private unwrap(result: MutationResult): Intent | null {
+    if (isVersionConflict(result)) throw preconditionFailed(result);
+    return result;
   }
 }

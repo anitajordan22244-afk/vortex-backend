@@ -22,6 +22,8 @@ function makeConfigService(
     databaseUrl: "postgresql://vortex:vortex@localhost:5432/vortex?schema=public",
     stellar,
     onchainIntentsEnabled: false,
+    intentsStore: "memory",
+    intentsVerifyIntervalMs: 60000,
     intentRetentionDays: 30,
     intentRetentionSweepMs: 60000,
     // Default to dry-run true for tests (safe default)

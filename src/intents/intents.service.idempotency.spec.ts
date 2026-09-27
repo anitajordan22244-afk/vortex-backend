@@ -1,5 +1,5 @@
 import { ConfigService } from "@nestjs/config";
-import { IntentsService } from "./intents.service";
+import { IntentsService, NewIntentData } from "./intents.service";
 import { IIntentsRepository } from "./intents.repository";
 import { Intent } from "./intents.types";
 import { AppConfig } from "../config/configuration";
@@ -12,7 +12,7 @@ import { PrismaService } from "../prisma/prisma.service";
  * intent, and the losers receive the winner's result.
  */
 
-type CreateData = Omit<Intent, "intentId" | "createdAt" | "state">;
+type CreateData = NewIntentData;
 
 const baseData: CreateData = {
   user: "GUSERADDRESS000000000000000000000000000000000000000000000",
@@ -56,6 +56,22 @@ class FakeIntentsRepository {
 
   async findById(id: string): Promise<Intent | undefined> {
     return this.store.get(id);
+  }
+
+  readonly keys = new Map<string, string>();
+
+  async findByIdempotencyKey(key: string): Promise<Intent | undefined> {
+    const id = this.keys.get(key);
+    return id ? this.store.get(id) : undefined;
+  }
+
+  /** Counts as a save; replays the holder of `key` when one exists. */
+  async createIdempotent(intent: Intent, key: string) {
+    const holder = await this.findByIdempotencyKey(key);
+    if (holder) return { intent: holder, created: false };
+    await this.save(intent);
+    this.keys.set(key, intent.intentId);
+    return { intent, created: true };
   }
 }
 

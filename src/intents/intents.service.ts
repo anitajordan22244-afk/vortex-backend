@@ -9,7 +9,13 @@ import { ConfigService } from "@nestjs/config";
 import { v4 as uuidv4 } from "uuid";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { Intent, IntentAuditEntry, IntentState } from "./intents.types";
-import { INTENTS_REPOSITORY, IIntentsRepository } from "./intents.repository";
+import {
+  INTENTS_REPOSITORY,
+  IIntentsRepository,
+  IntentPatch,
+  isVersionConflict,
+  MutationResult,
+} from "./intents.repository";
 import { AppConfig } from "../config/configuration";
 import {
   CHAIN_DEADLINE_DEFAULTS,
@@ -25,6 +31,18 @@ const TERMINAL_STATES: IntentState[] = ["filled", "cancelled", "expired", "slash
 
 /** How long a completed idempotency-key result stays replayable. */
 const IDEMPOTENCY_TTL_SECONDS = 86_400; // 24 hours
+
+/**
+ * Upper bound on re-read-and-retry attempts after a VersionConflict
+ * (issue #405). Keeps retry loops bounded even under sustained contention.
+ */
+export const MAX_VERSION_RETRIES = 3;
+
+/** Caller-supplied fields for a new intent; everything else is assigned by the service. */
+export type NewIntentData = Omit<
+  Intent,
+  "intentId" | "createdAt" | "state" | "version" | "srcVerified" | "srcVerification"
+>;
 
 /**
  * Maximum number of simultaneously open (state = "open" | "accepted") intents
@@ -56,17 +74,11 @@ export class IntentsService implements OnModuleDestroy {
   private readonly logger = new Logger(IntentsService.name);
 
   /**
-   * Idempotency cache: maps caller-supplied keys → { intentId, expiresAt }.
-   * Kept in-service (not in the repository) because it is a short-lived
-   * request deduplication concern, not a durable persistence concern.
-   */
-  private readonly idempotencyCache = new Map<string, { intentId: string; expiresAt: number }>();
-
-  /**
-   * Keys whose creation is currently in flight → the in-flight creation
-   * promise. Claimed synchronously in {@link create} so that concurrent
-   * requests carrying the same idempotency key collapse onto a single created
-   * intent instead of racing the check-then-set window (issue #274).
+   * Keys whose creation is currently in flight in *this* process → the
+   * in-flight creation promise. Claimed synchronously in {@link create} so
+   * concurrent requests carrying the same idempotency key collapse onto a
+   * single on-chain registration (issue #274). Cross-replica uniqueness is
+   * enforced by the repository's unique idempotency-key index (issue #404).
    */
   private readonly idempotencyInFlight = new Map<string, Promise<Intent>>();
 
@@ -109,9 +121,9 @@ export class IntentsService implements OnModuleDestroy {
   }
 
   private async evictTerminalIntents(): Promise<number> {
-    const persistence = process.env.INTENTS_PERSISTENCE ?? "memory";
+    const store = this.configService.get("intentsStore", { infer: true }) ?? "memory";
     const onchainEnabled = this.configService.get("onchainIntentsEnabled", { infer: true });
-    if (persistence !== "memory" || onchainEnabled) {
+    if (store !== "memory" || onchainEnabled) {
       return 0;
     }
 
@@ -138,67 +150,57 @@ export class IntentsService implements OnModuleDestroy {
     return evicted;
   }
 
-  async create(
-    data: Omit<Intent, "intentId" | "createdAt" | "state">,
-    idempotencyKey?: string,
-  ): Promise<Intent> {
+  /**
+   * Create an intent. With an `idempotencyKey`, repeat and concurrent calls
+   * within {@link IDEMPOTENCY_TTL_SECONDS} return the first intent — within
+   * one process via the in-flight map, and across replicas via the
+   * repository's atomic `createIdempotent` (issue #404).
+   */
+  async create(data: NewIntentData, idempotencyKey?: string): Promise<Intent> {
     if (!idempotencyKey) {
-      return this.persistNewIntent(data);
+      const intent = await this.buildNewIntent(data);
+      return this.repo.save(intent);
     }
 
-    const now = Math.floor(Date.now() / 1000);
-
-    // 1. Fast path — a previous request with this key already completed.
-    const cached = this.idempotencyCache.get(idempotencyKey);
-    if (cached && cached.expiresAt > now) {
-      const cachedIntent = await this.repo.findById(cached.intentId);
-      if (cachedIntent) {
-        return cachedIntent;
-      }
-      // Cache entry outlived its intent — drop it and fall through.
-      this.idempotencyCache.delete(idempotencyKey);
-    }
-
-    // 2. Race-safe claim. The check-and-set on `idempotencyInFlight` runs
-    //    synchronously — there is no `await` between the `get` and the `set` —
-    //    so two concurrent callers carrying the same key can never both proceed
-    //    to create. The loser awaits the winner's in-flight promise and returns
-    //    its result. The claim is taken *before* the conditional
-    //    `registerOnChain()` await inside persistNewIntent(), so the race window
-    //    is closed rather than merely shifted past the on-chain call.
-    //
-    //    The future Prisma-backed adapter (issue #1) must preserve the same
-    //    guarantee at the storage layer: an atomic
-    //    `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` followed by a
-    //    read-back of the winning row, rather than a read-then-write.
+    // Race-safe claim: no `await` between this `get` and the `set` below, so
+    // two concurrent callers in this process can never both proceed — the
+    // loser awaits the winner's promise. The claim precedes the conditional
+    // registerOnChain() await inside buildNewIntent().
     const inFlight = this.idempotencyInFlight.get(idempotencyKey);
     if (inFlight) {
       return inFlight;
     }
 
-    const creation = this.persistNewIntent(data)
-      .then((intent) => {
-        this.idempotencyCache.set(idempotencyKey, {
-          intentId: intent.intentId,
-          expiresAt: now + IDEMPOTENCY_TTL_SECONDS,
-        });
-        return intent;
-      })
-      .finally(() => {
-        this.idempotencyInFlight.delete(idempotencyKey);
-      });
-
+    const creation = this.createIdempotent(data, idempotencyKey).finally(() => {
+      this.idempotencyInFlight.delete(idempotencyKey);
+    });
     this.idempotencyInFlight.set(idempotencyKey, creation);
     return creation;
   }
 
+  private async createIdempotent(data: NewIntentData, idempotencyKey: string): Promise<Intent> {
+    const minCreatedAt = Math.floor(Date.now() / 1000) - IDEMPOTENCY_TTL_SECONDS;
+
+    const existing = await this.repo.findByIdempotencyKey(idempotencyKey, minCreatedAt);
+    if (existing) return existing;
+
+    const intent = await this.buildNewIntent(data);
+    const result = await this.repo.createIdempotent(intent, idempotencyKey, minCreatedAt);
+    if (!result.created) {
+      // Another replica won the INSERT race between our lookup and insert.
+      this.logger.warn(
+        `[idempotency] key collision resolved to intent ${result.intent.intentId}; ` +
+          `discarded candidate ${intent.intentId}`,
+      );
+    }
+    return result.intent;
+  }
+
   /**
-   * Build, optionally register on-chain, and persist a brand-new intent.
-   * Contains no idempotency logic — deduplication is the caller's concern.
+   * Build and optionally register on-chain a brand-new intent. Contains no
+   * persistence or idempotency logic — those are the caller's concern.
    */
-  private async persistNewIntent(
-    data: Omit<Intent, "intentId" | "createdAt" | "state">,
-  ): Promise<Intent> {
+  private async buildNewIntent(data: NewIntentData): Promise<Intent> {
     const now = Math.floor(Date.now() / 1000);
 
     const intent: Intent = {
@@ -208,13 +210,14 @@ export class IntentsService implements OnModuleDestroy {
       createdAt: now,
       deadline:
         data.deadline ?? now + (CHAIN_DEADLINE_DEFAULTS[data.srcChain] ?? DEFAULT_DEADLINE_SECONDS),
+      version: 0,
+      srcVerified: true,
     };
 
     if (this.configService.get("onchainIntentsEnabled", { infer: true })) {
       await this.registerOnChain(intent);
     }
 
-    await this.repo.save(intent);
     return intent;
   }
 
@@ -282,59 +285,76 @@ export class IntentsService implements OnModuleDestroy {
    *
    * IDs are de-duplicated; IDs with no matching record are simply omitted from
    * the result (callers get "missing" by comparing lengths, not a 404 per ID).
-   *
-   * This reuses `get()` per ID rather than adding a storage-layer method — fine
-   * for the in-memory adapter. Issue #1's Prisma adapter should implement this
-   * as a single `WHERE intent_id IN (...)` query for efficiency.
+   * Backed by a single `WHERE intent_id IN (...)` query in Postgres.
    */
   async getMany(ids: string[]): Promise<Intent[]> {
-    const unique = [...new Set(ids)];
-    const found = await Promise.all(unique.map((id) => this.get(id)));
-    return found.filter((intent): intent is Intent => intent !== undefined);
+    return this.repo.findManyByIds(ids);
   }
 
   async getAcceptedCountBySolver(solver: string): Promise<number> {
-    const all = await this.repo.findAll();
-    return all.filter((i) => i.state === "accepted" && i.solver === solver).length;
+    return this.repo.countAcceptedBySolver(solver);
   }
 
   /**
    * Count the number of intents in "open" or "accepted" state for a user.
-   *
-   * Used by IntentsController.create() to enforce MAX_OPEN_INTENTS_PER_USER.
-   * The query is a simple filter over findByUser so it works identically
-   * against the in-memory adapter and — once the repo is swapped — can be
-   * replaced with an efficient Prisma COUNT query without touching the service
-   * interface (issue #1).
+   * Used by IntentsController.create() to enforce MAX_OPEN_INTENTS_PER_USER;
+   * a single COUNT(*) in Postgres.
    */
   async countOpenByUser(user: string): Promise<number> {
-    const userIntents = await this.repo.findByUser(user);
-    return userIntents.filter(
-      (i) => i.state === "open" || i.state === "accepted",
-    ).length;
-  }
-
-  async update(id: string, patch: Partial<Intent>): Promise<Intent | null> {
-    return this.repo.update(id, patch);
+    return this.repo.countActiveByUser(user);
   }
 
   /**
-   * Atomically accept an intent only if it is currently "open".
-   * Delegates to the repository so both in-memory and Prisma adapters can
-   * apply the conditional write atomically.
+   * Apply `patch` only if the intent is still at `expectedVersion`
+   * (issue #405). Returns a VersionConflict otherwise — callers decide
+   * whether to retry or surface a 409/412.
+   */
+  async update(id: string, patch: IntentPatch, expectedVersion: number): Promise<MutationResult> {
+    return this.repo.update(id, patch, expectedVersion);
+  }
+
+  /**
+   * Re-read → mutate loop for writers for whom retrying is semantically safe
+   * (the sweeper, quote persistence, deposit verification). `mutate` receives
+   * the freshly-read intent and returns the versioned mutation to attempt, or
+   * `undefined` when the intent no longer needs changing — which ends the loop
+   * with `null`. Bounded by {@link MAX_VERSION_RETRIES}; if every attempt
+   * conflicts, the last VersionConflict is returned.
+   */
+  async mutateWithRetry(
+    id: string,
+    mutate: (current: Intent) => Promise<MutationResult> | MutationResult | undefined,
+    maxAttempts = MAX_VERSION_RETRIES,
+  ): Promise<MutationResult> {
+    let last: MutationResult = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const current = await this.repo.findById(id);
+      if (!current) return null;
+      const pending = mutate(current);
+      if (pending === undefined) return null;
+      last = await pending;
+      if (!isVersionConflict(last)) return last;
+    }
+    this.logger.warn(`[occ] gave up on intent ${id} after ${maxAttempts} version conflicts`);
+    return last;
+  }
+
+  /**
+   * Atomically accept an intent only if it is currently "open" (and, when
+   * given, still at `expectedVersion`).
    *
    * The new deadline is set to now + CHAIN_FILL_WINDOW_DEFAULTS[srcChain]
    * so solvers on slower-settling chains get a proportionally longer window
    * and are not unfairly slashed for a deadline that was never realistic.
    * Returns null when the intent is not found or is not in the "open" state.
    */
-  async acceptIfOpen(id: string, solver: string): Promise<Intent | null> {
+  async acceptIfOpen(id: string, solver: string, expectedVersion?: number): Promise<MutationResult> {
     const intent = await this.repo.findById(id);
     if (!intent) return null;
     const now = Math.floor(Date.now() / 1000);
     const fillWindow =
       CHAIN_FILL_WINDOW_DEFAULTS[intent.srcChain] ?? DEFAULT_FILL_WINDOW_SECONDS;
-    return this.repo.acceptIfOpen(id, solver, now + fillWindow);
+    return this.repo.acceptIfOpen(id, solver, now + fillWindow, expectedVersion);
   }
 
   /**
@@ -345,9 +365,10 @@ export class IntentsService implements OnModuleDestroy {
   async fillIfAccepted(
     id: string,
     solver: string,
-    patch: Omit<Partial<Intent>, "state" | "solver">,
-  ): Promise<Intent | null> {
-    return this.repo.fillIfAccepted(id, solver, patch);
+    patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    expectedVersion?: number,
+  ): Promise<MutationResult> {
+    return this.repo.fillIfAccepted(id, solver, patch, expectedVersion);
   }
 
   /**
@@ -355,8 +376,8 @@ export class IntentsService implements OnModuleDestroy {
    * Returns null when the intent is not found or is not in the "open" state
    * (e.g. a concurrent accept() or sweeper expiry already transitioned it).
    */
-  async cancelIfOpen(id: string): Promise<Intent | null> {
-    return this.repo.cancelIfOpen(id);
+  async cancelIfOpen(id: string, expectedVersion?: number): Promise<MutationResult> {
+    return this.repo.cancelIfOpen(id, expectedVersion);
   }
 
   /**
@@ -364,8 +385,8 @@ export class IntentsService implements OnModuleDestroy {
    * Used by the sweeper so a concurrent user cancel() or solver accept()
    * always wins the race.
    */
-  async expireIfOpen(id: string): Promise<Intent | null> {
-    return this.repo.expireIfOpen(id);
+  async expireIfOpen(id: string, expectedVersion?: number): Promise<MutationResult> {
+    return this.repo.expireIfOpen(id, expectedVersion);
   }
 
   /**
@@ -375,8 +396,9 @@ export class IntentsService implements OnModuleDestroy {
   async slashIfAccepted(
     id: string,
     patch: { slashedAt: number; slashReason: string },
-  ): Promise<Intent | null> {
-    return this.repo.slashIfAccepted(id, patch);
+    expectedVersion?: number,
+  ): Promise<MutationResult> {
+    return this.repo.slashIfAccepted(id, patch, expectedVersion);
   }
 
   // ---------------------------------------------------------------------------

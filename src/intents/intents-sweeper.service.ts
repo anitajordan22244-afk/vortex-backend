@@ -5,6 +5,8 @@ import { SolversService } from "../solvers/solvers.service";
 import { SolverRegistryService } from "../soroban/solver-registry.service";
 import { logger } from "../common/logger";
 import { MetricsService } from "../metrics/metrics.service";
+import { isVersionConflict } from "./intents.repository";
+import { Intent } from "./intents.types";
 
 const SWEEP_INTERVAL_MS = 30_000;
 
@@ -48,10 +50,16 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
 
     for (const intent of await this.intentsService.getByState("open")) {
       if (intent.deadline <= now) {
-        // Atomic guard: a concurrent user cancel() or solver accept() may have
-        // already transitioned this intent out of "open" — skip it if so.
-        const expired = await this.intentsService.expireIfOpen(intent.intentId);
-        if (!expired) continue;
+        // Optimistic concurrency (issue #405): expire only the version we
+        // read. If another writer got there first, re-read and retry only
+        // while the intent is still open and past its deadline — a
+        // concurrent cancel()/accept() always wins.
+        const expired = await this.intentsService.mutateWithRetry(intent.intentId, (current) =>
+          current.state === "open" && current.deadline <= now
+            ? this.intentsService.expireIfOpen(current.intentId, current.version)
+            : undefined,
+        );
+        if (!expired || isVersionConflict(expired)) continue;
         // Audit trail (issue #62): system-driven expiration.
         this.intentsService.appendAuditEntry(
           intent.intentId,
@@ -82,8 +90,7 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
     );
 
     for (const intent of missedFills) {
-      await this.slashMissedFill(intent.intentId, intent.solver, now);
-      slashedCount++;
+      if (await this.slashMissedFill(intent, now)) slashedCount++;
     }
 
     return { expiredCount, slashedCount, durationMs: Date.now() - startMs };
@@ -119,27 +126,33 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async slashMissedFill(
-    intentId: string,
-    solver: string | undefined,
-    now: number,
-  ) {
+  /** Returns true when this call slashed the intent. */
+  private async slashMissedFill(intent: Intent, now: number): Promise<boolean> {
+    const { intentId } = intent;
     const reason = "accepted intent not filled before deadline";
 
-    // Atomic guard: a concurrent solver fill() may have already transitioned
-    // this intent out of "accepted" — skip slashing if so.
-    const slashed = await this.intentsService.slashIfAccepted(intentId, {
-      slashedAt: now,
-      slashReason: reason,
-    });
-    if (!slashed) return;
+    // Optimistic concurrency (issue #405): slash only the version we read.
+    // A fill that lands between our read and this write bumps the version,
+    // so a late sweeper can never overwrite it and wrongly slash the solver.
+    // On conflict, re-read and retry only while still accepted and overdue.
+    const slashed = await this.intentsService.mutateWithRetry(intentId, (current) =>
+      current.state === "accepted" && current.deadline <= now
+        ? this.intentsService.slashIfAccepted(
+            intentId,
+            { slashedAt: now, slashReason: reason },
+            current.version,
+          )
+        : undefined,
+    );
+    if (!slashed || isVersionConflict(slashed)) return false;
+    const solver = slashed.solver;
     await this.intentsGateway.broadcast({ type: "intent_slashed", intentId, solver, reason });
 
     if (!solver) {
       // Shouldn't happen in practice — an "accepted" intent always has a
       // solver — but don't let a bad record throw the whole sweep cycle.
       logger.error(`[sweeper] intent ${intentId} was accepted with no solver on record`);
-      return;
+      return true;
     }
 
     await this.solversService.recordFailedFill(solver, intentId);
@@ -153,5 +166,6 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
     console.log(
       `[sweeper] slashed solver=${solver} for intent=${intentId}: ${result.detail} slashId=${slashRecord?.slashId ?? "unknown"}`,
     );
+    return true;
   }
 }

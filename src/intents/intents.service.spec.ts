@@ -4,7 +4,19 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { AppConfig, CHAIN_FILL_WINDOW_DEFAULTS, DEFAULT_FILL_WINDOW_SECONDS } from "../config/configuration";
 import { StellarTxService } from "../soroban/stellar-tx.service";
 import { IntentsService } from "./intents.service";
-import { INTENTS_REPOSITORY, InMemoryIntentsRepository } from "./intents.repository";
+import {
+  INTENTS_REPOSITORY,
+  InMemoryIntentsRepository,
+  MutationResult,
+  VersionConflict,
+} from "./intents.repository";
+import { Intent } from "./intents.types";
+
+/** Narrow a MutationResult to the Intent a successful mutation returns. */
+function intentOf(result: MutationResult | undefined): Intent {
+  if (!result || result instanceof VersionConflict) throw new Error(`expected an intent, got ${JSON.stringify(result)}`);
+  return result;
+}
 import { PrismaService } from "../prisma/prisma.service";
 
 const VALID_CONTRACT_ID = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
@@ -141,15 +153,15 @@ describe("IntentsService", () => {
 
   it("update mutates and returns the patched intent", async () => {
     const [existing] = await service.getByState("open");
-    const updated = await service.update(existing.intentId, { state: "accepted", solver: "SOLVER_X" });
+    const updated = await service.update(existing.intentId, { state: "accepted", solver: "SOLVER_X" }, existing.version);
 
-    expect(updated?.state).toBe("accepted");
-    expect(updated?.solver).toBe("SOLVER_X");
+    expect(intentOf(updated).state).toBe("accepted");
+    expect(intentOf(updated).solver).toBe("SOLVER_X");
     expect((await service.get(existing.intentId))?.state).toBe("accepted");
   });
 
   it("update returns null for an unknown id", async () => {
-    expect(await service.update("does-not-exist", { state: "cancelled" })).toBeNull();
+    expect(await service.update("does-not-exist", { state: "cancelled" }, 0)).toBeNull();
   });
 
   it("getByUser is case-insensitive", async () => {
@@ -170,8 +182,8 @@ describe("IntentsService", () => {
       const result = await service.acceptIfOpen(open.intentId, "SOLVER_X");
 
       expect(result).not.toBeNull();
-      expect(result!.state).toBe("accepted");
-      expect(result!.solver).toBe("SOLVER_X");
+      expect(intentOf(result).state).toBe("accepted");
+      expect(intentOf(result).solver).toBe("SOLVER_X");
       expect((await service.get(open.intentId))!.state).toBe("accepted");
     });
 
@@ -194,7 +206,7 @@ describe("IntentsService", () => {
 
       const successes = results.filter((r) => r !== null);
       expect(successes).toHaveLength(1);
-      expect(successes[0]!.state).toBe("accepted");
+      expect(intentOf(successes[0]).state).toBe("accepted");
     });
 
     // -----------------------------------------------------------------------
@@ -218,8 +230,8 @@ describe("IntentsService", () => {
       expect(result).not.toBeNull();
       const expectedWindow = CHAIN_FILL_WINDOW_DEFAULTS["stellar"] ?? DEFAULT_FILL_WINDOW_SECONDS;
       // Allow a 2-second tolerance for test execution time
-      expect(result!.deadline).toBeGreaterThanOrEqual(now + expectedWindow - 2);
-      expect(result!.deadline).toBeLessThanOrEqual(now + expectedWindow + 2);
+      expect(intentOf(result).deadline).toBeGreaterThanOrEqual(now + expectedWindow - 2);
+      expect(intentOf(result).deadline).toBeLessThanOrEqual(now + expectedWindow + 2);
     });
 
     it("sets deadline to now + ethereum fill window (1800 s) for an ethereum intent", async () => {
@@ -239,8 +251,8 @@ describe("IntentsService", () => {
       expect(result).not.toBeNull();
       const expectedWindow = CHAIN_FILL_WINDOW_DEFAULTS["ethereum"] ?? DEFAULT_FILL_WINDOW_SECONDS;
       // Allow a 2-second tolerance for test execution time
-      expect(result!.deadline).toBeGreaterThanOrEqual(now + expectedWindow - 2);
-      expect(result!.deadline).toBeLessThanOrEqual(now + expectedWindow + 2);
+      expect(intentOf(result).deadline).toBeGreaterThanOrEqual(now + expectedWindow - 2);
+      expect(intentOf(result).deadline).toBeLessThanOrEqual(now + expectedWindow + 2);
     });
 
     it("stellar and ethereum accepted intents get distinct (non-equal) fill deadlines", async () => {
@@ -272,7 +284,7 @@ describe("IntentsService", () => {
       expect(ethResult).not.toBeNull();
 
       // Ethereum solver gets a materially larger fill window than Stellar
-      expect(ethResult!.deadline).toBeGreaterThan(stellarResult!.deadline);
+      expect(intentOf(ethResult).deadline).toBeGreaterThan(intentOf(stellarResult).deadline);
 
       // Confirm the windows match the config constants exactly (allowing 2 s clock drift)
       const stellarWindow = CHAIN_FILL_WINDOW_DEFAULTS["stellar"] ?? DEFAULT_FILL_WINDOW_SECONDS;
@@ -292,13 +304,13 @@ describe("IntentsService", () => {
         deadline: now + 3600,
       });
       // Manually patch to an unknown chain to exercise the fallback
-      await service.update(intent.intentId, { srcChain: "unknown_chain" as never });
+      await service.update(intent.intentId, { srcChain: "unknown_chain" as never }, intent.version);
 
       const result = await service.acceptIfOpen(intent.intentId, "SOLVER_X");
 
       expect(result).not.toBeNull();
-      expect(result!.deadline).toBeGreaterThanOrEqual(now + DEFAULT_FILL_WINDOW_SECONDS - 2);
-      expect(result!.deadline).toBeLessThanOrEqual(now + DEFAULT_FILL_WINDOW_SECONDS + 2);
+      expect(intentOf(result).deadline).toBeGreaterThanOrEqual(now + DEFAULT_FILL_WINDOW_SECONDS - 2);
+      expect(intentOf(result).deadline).toBeLessThanOrEqual(now + DEFAULT_FILL_WINDOW_SECONDS + 2);
     });
   }); // end describe("acceptIfOpen")
 
@@ -312,8 +324,8 @@ describe("IntentsService", () => {
       });
 
       expect(result).not.toBeNull();
-      expect(result!.state).toBe("filled");
-      expect(result!.fillAmount).toBe("100");
+      expect(intentOf(result).state).toBe("filled");
+      expect(intentOf(result).fillAmount).toBe("100");
     });
 
     it("returns null when solver does not match", async () => {
@@ -342,7 +354,7 @@ describe("IntentsService", () => {
 
       const successes = results.filter((r) => r !== null);
       expect(successes).toHaveLength(1);
-      expect(successes[0]!.state).toBe("filled");
+      expect(intentOf(successes[0]).state).toBe("filled");
     });
   });
 
@@ -351,10 +363,10 @@ describe("IntentsService", () => {
       const stellarTxService = fakeStellarTxService();
       const service = makeService({ onchainIntentsEnabled: false }, stellarTxService);
 
-      const intent = await svc.create(validCreateData());
+      const intent = await service.create(validCreateData());
 
       expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
-      expect(await svc.get(intent.intentId)).toEqual(intent);
+      expect(await service.get(intent.intentId)).toEqual(intent);
     });
 
     it("invokes the settlement contract and preserves the Intent shape when the flag is on", async () => {
@@ -366,7 +378,7 @@ describe("IntentsService", () => {
       );
 
       const data = validCreateData();
-      const intent = await svc.create(data);
+      const intent = await service.create(data);
 
       expect(stellarTxService.invokeContract).toHaveBeenCalledTimes(1);
       const call = stellarTxService.invokeContract.mock.calls[0][0];
@@ -386,21 +398,23 @@ describe("IntentsService", () => {
           state: "",
           createdAt: 0,
           deadline: 0,
+          version: 0,
+          srcVerified: true,
         }).sort(),
       );
-      expect(await svc.get(intent.intentId)).toBeDefined();
+      expect(await service.get(intent.intentId)).toBeDefined();
     });
 
     it("rejects with a clear error and does not create the intent when SETTLEMENT_CONTRACT_ID is unset", async () => {
       const stellarTxService = fakeStellarTxService();
       const service = makeService({ onchainIntentsEnabled: true }, stellarTxService);
-      const before = service.getAll().length;
+      const before = (await service.getAll()).length;
 
-      await expect(svc.create(validCreateData())).rejects.toMatchObject({
+      await expect(service.create(validCreateData())).rejects.toMatchObject({
         message: expect.stringContaining("SETTLEMENT_CONTRACT_ID"),
       });
       expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
-      expect(await svc.getAll()).toHaveLength(before);
+      expect(await service.getAll()).toHaveLength(before);
     });
 
     it("rejects and does not create the intent when the on-chain call fails", async () => {
@@ -410,10 +424,10 @@ describe("IntentsService", () => {
         { onchainIntentsEnabled: true, settlementContractId: VALID_CONTRACT_ID },
         stellarTxService,
       );
-      const before = (await svc.getAll()).length;
+      const before = (await service.getAll()).length;
 
-      await expect(svc.create(validCreateData())).rejects.toThrow(/settlement contract/i);
-      expect(await svc.getAll()).toHaveLength(before);
+      await expect(service.create(validCreateData())).rejects.toThrow(/settlement contract/i);
+      expect(await service.getAll()).toHaveLength(before);
     });
   });
 

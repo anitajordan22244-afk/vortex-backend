@@ -70,6 +70,13 @@ model Intent {
   feeAmount      String?     @map("fee_amount")
   /// On-chain transaction hash of the Stellar fill transaction.
   txHash         String?     @map("tx_hash")
+  /// Unix epoch seconds – set when state becomes `slashed`.
+  slashedAt      Int?        @map("slashed_at")
+  slashReason    String?     @map("slash_reason")
+  /// Optimistic-concurrency version, incremented on every update (issue #405).
+  version        Int         @default(0) @map("version")
+  /// Caller-supplied idempotency key for POST /intents; unique across replicas (issue #404).
+  idempotencyKey String?     @unique @map("idempotency_key")
 
   @@index([user])
   @@index([state])

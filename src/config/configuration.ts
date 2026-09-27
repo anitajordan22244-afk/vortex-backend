@@ -74,6 +74,19 @@ export const CHAIN_FILL_WINDOW_DEFAULTS: Record<string, number> = {
 /** Fallback fill-window when chain is not in the map. */
 export const DEFAULT_FILL_WINDOW_SECONDS = 600;
 
+/** Intent storage backend selected by INTENTS_STORE (issue #404). */
+export type IntentsStore = "memory" | "dual" | "postgres";
+
+/**
+ * Resolve INTENTS_STORE, honouring the deprecated INTENTS_PERSISTENCE alias
+ * (`prisma` → `postgres`) so existing deployments keep their behaviour.
+ */
+export function resolveIntentsStore(env: NodeJS.ProcessEnv = process.env): IntentsStore {
+  const store = env.INTENTS_STORE;
+  if (store === "memory" || store === "dual" || store === "postgres") return store;
+  return env.INTENTS_PERSISTENCE === "prisma" ? "postgres" : "memory";
+}
+
 export interface AppConfig {
   nodeEnv: string;
   port: number;
@@ -93,6 +106,15 @@ export interface AppConfig {
     feePercentile: FeePercentile;
   };
   onchainIntentsEnabled: boolean;
+  /**
+   * Intent storage backend (issue #404):
+   *   memory   — in-process Map only (default; dev/test, no database needed)
+   *   dual     — write both stores, read memory, verifier compares them
+   *   postgres — PrismaIntentsRepository is the only store
+   */
+  intentsStore: IntentsStore;
+  /** How often the dual-write consistency verifier runs, in ms. */
+  intentsVerifyIntervalMs: number;
   intentRetentionDays: number;
   intentRetentionSweepMs: number;
   /**
@@ -131,6 +153,8 @@ export default (): AppConfig => ({
     feePercentile: (process.env.SOROBAN_FEE_PERCENTILE ?? "p50") as FeePercentile,
   },
   onchainIntentsEnabled: (process.env.ONCHAIN_INTENTS_ENABLED ?? "false") === "true",
+  intentsStore: resolveIntentsStore(process.env),
+  intentsVerifyIntervalMs: parseInt(process.env.INTENTS_VERIFY_INTERVAL_MS ?? "60000", 10),
   intentRetentionDays: parseInt(process.env.INTENT_RETENTION_DAYS ?? "30", 10),
   intentRetentionSweepMs: parseInt(process.env.INTENT_RETENTION_SWEEP_MS ?? "60000", 10),
   // Default to dry-run (true) outside production; in production the value must

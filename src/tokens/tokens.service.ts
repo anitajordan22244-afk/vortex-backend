@@ -1,7 +1,7 @@
 import { BadRequestException, Inject, Injectable } from "@nestjs/common";
 import { SUPPORTED_TOKENS, StellarToken } from "./tokens.data";
 import { SupportedChain } from "../intents/intents.types";
-import { ITokensRepository, TOKENS_REPOSITORY, TokenRecord } from "./tokens.repository";
+import { ITokensRepository, TOKENS_REPOSITORY } from "./tokens.repository";
 
 /**
  * A resolved source-chain (EVM or Stellar source) token — always has a

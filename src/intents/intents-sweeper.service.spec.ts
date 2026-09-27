@@ -85,7 +85,7 @@ describe("IntentsSweeperService", () => {
       minDstAmount: "990000",
       deadline: deadline + 10_000, // create as open with a far-future deadline first
     });
-    await intentsService.update(intent.intentId, { state: "accepted", solver, deadline });
+    await intentsService.update(intent.intentId, { state: "accepted", solver, deadline }, intent.version);
     return intent.intentId;
   }
 
@@ -172,7 +172,7 @@ describe("IntentsSweeperService", () => {
       minDstAmount: "990000",
       deadline: past + 10_000,
     });
-    await intentsService.update(intent.intentId, { state: "accepted", deadline: past });
+    await intentsService.update(intent.intentId, { state: "accepted", deadline: past }, intent.version);
 
     await expect(sweeper.sweep()).resolves.not.toThrow();
     expect((await intentsService.get(intent.intentId))?.state).toBe("slashed");
@@ -216,5 +216,90 @@ describe("IntentsSweeperService", () => {
 
     const [expiredCount] = (metricsService.recordSweep as jest.Mock).mock.calls[0] as [number, number];
     expect(expiredCount).toBe(2);
+  });
+
+  // ── #405: optimistic concurrency against late sweeper writes ────────────
+
+  describe("optimistic concurrency (issue #405)", () => {
+    /** Make the sweeper act on a snapshot taken *before* a concurrent write. */
+    async function sweepWithStaleSnapshot(intentId: string, concurrentWrite: () => Promise<unknown>) {
+      const stale = (await intentsService.get(intentId))!;
+      await concurrentWrite();
+      const realGetByState = intentsService.getByState.bind(intentsService);
+      jest
+        .spyOn(intentsService, "getByState")
+        .mockImplementation(async (state) =>
+          state === stale.state ? [stale] : realGetByState(state),
+        );
+      return sweeper.sweep();
+    }
+
+    it("never slashes a fill that landed after the sweeper read the intent", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past);
+
+      const result = await sweepWithStaleSnapshot(intentId, () =>
+        intentsService.fillIfAccepted(intentId, ALPHA_ADDR, { fillAmount: "995000", filledAt: past, txHash: "h" }),
+      );
+
+      expect((await intentsService.get(intentId))?.state).toBe("filled");
+      expect(result.slashedCount).toBe(0);
+      expect(solverRegistryService.slashSolver).not.toHaveBeenCalled();
+    });
+
+    it("re-reads and still slashes when the concurrent write left it accepted and overdue", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past);
+
+      const result = await sweepWithStaleSnapshot(intentId, async () => {
+        const current = (await intentsService.get(intentId))!;
+        await intentsService.update(intentId, { quotedDstAmount: "1" }, current.version);
+      });
+
+      const final = (await intentsService.get(intentId))!;
+      expect(final.state).toBe("slashed");
+      expect(final.quotedDstAmount).toBe("1"); // the concurrent write was not lost
+      expect(result.slashedCount).toBe(1);
+    });
+
+    it("never expires an intent a user cancelled after the sweeper read it", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intent = await intentsService.create({
+        user: "GTEST...0003",
+        srcChain: "stellar",
+        srcToken: { address: "native", symbol: "XLM", name: "Stellar Lumens", decimals: 7, chain: "stellar" },
+        srcAmount: "1000000",
+        dstToken: { contract: "CTEST", symbol: "USDC", decimals: 7 },
+        minDstAmount: "990000",
+        deadline: past,
+      });
+
+      const result = await sweepWithStaleSnapshot(intent.intentId, () => intentsService.cancelIfOpen(intent.intentId));
+
+      expect((await intentsService.get(intent.intentId))?.state).toBe("cancelled");
+      expect(result.expiredCount).toBe(0);
+    });
+
+    it("gives up after MAX_VERSION_RETRIES under sustained contention", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past);
+      const slash = jest.spyOn(intentsService, "slashIfAccepted");
+      // Every attempt races a concurrent writer that bumps the version first.
+      slash.mockImplementation(async (id, patch, expectedVersion) => {
+        const current = (await intentsService.get(id))!;
+        await intentsService.update(id, { quotedDstAmount: String(Math.random()) }, current.version);
+        return (intentsService as unknown as { repo: InMemoryIntentsRepository }).repo.slashIfAccepted(
+          id,
+          patch,
+          expectedVersion,
+        );
+      });
+
+      const result = await sweeper.sweep();
+
+      expect(slash).toHaveBeenCalledTimes(3);
+      expect(result.slashedCount).toBe(0);
+      expect((await intentsService.get(intentId))?.state).toBe("accepted");
+    });
   });
 });

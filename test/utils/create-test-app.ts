@@ -27,13 +27,23 @@ class MockPrismaService {
   };
 }
 
+/**
+ * With INTENTS_STORE=postgres|dual (issue #404 — CI runs the suite both ways)
+ * the real PrismaService is used against DATABASE_URL; otherwise the stub
+ * above keeps the suite database-free.
+ */
+function usesRealDatabase(): boolean {
+  return process.env.INTENTS_STORE === "postgres" || process.env.INTENTS_STORE === "dual";
+}
+
 export async function createTestApp(): Promise<INestApplication> {
-  const moduleRef = await Test.createTestingModule({
+  const builder = Test.createTestingModule({
     imports: [AppModule],
-  })
-    .overrideProvider(PrismaService)
-    .useClass(MockPrismaService)
-    .compile();
+  });
+  if (!usesRealDatabase()) {
+    builder.overrideProvider(PrismaService).useClass(MockPrismaService);
+  }
+  const moduleRef = await builder.compile();
 
   const app = moduleRef.createNestApplication();
 

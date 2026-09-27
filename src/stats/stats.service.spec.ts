@@ -18,6 +18,8 @@ function baseIntent(overrides: Partial<Intent> = {}): Intent {
     state: "open",
     createdAt: 1_000_000,
     deadline: 1_001_800,
+    version: 0,
+    srcVerified: true,
     ...overrides,
   };
 }
@@ -33,6 +35,7 @@ function baseSolver(overrides: Partial<SolverRecord> = {}): SolverRecord {
     avgFillTime: 30,
     isActive: true,
     registeredAt: 900_000,
+    lastActiveAt: 900_000,
     supportedChains: ["stellar"],
     supportedTokens: ["USDC"],
     ...overrides,

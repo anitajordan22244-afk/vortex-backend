@@ -88,6 +88,46 @@ export interface Intent {
   txHash?: string; // fill tx on Stellar
   slashedAt?: number;
   slashReason?: string;
+  /**
+   * Optimistic-concurrency version (issue #405). Starts at 0 on creation and
+   * is incremented by exactly one on every successful mutation. Exposed to
+   * HTTP clients as the `ETag` of `GET /api/v1/intents/:id`.
+   */
+  version: number;
+  /**
+   * Whether the user's source-chain deposit has been verified (issue #403).
+   * Intents stay `open` but are hidden from `GET /intents/open` and cannot be
+   * accepted until this is true.
+   */
+  srcVerified: boolean;
+  /** Source-chain transaction that performed the escrow deposit, if supplied. */
+  srcTxHash?: string;
+  /** Details of the most recent source-deposit verification attempt. */
+  srcVerification?: SrcVerification;
+}
+
+/** Outcome of the source-chain deposit check for an intent (issue #403). */
+export type SrcVerificationStatus =
+  | "pending"
+  | "verified"
+  | "not_found"
+  | "mismatch"
+  | "reorged"
+  | "skipped"
+  | "grandfathered";
+
+export interface SrcVerification {
+  status: SrcVerificationStatus;
+  /** Unix epoch seconds of the last check. */
+  checkedAt: number;
+  /** Block the matching `Deposited` log was found in. */
+  blockNumber?: string;
+  /** Hash of that block — compared on re-checks to detect reorgs. */
+  blockHash?: string;
+  /** Amount the escrow actually received (base units) — may be < srcAmount for fee-on-transfer tokens. */
+  receivedAmount?: string;
+  /** Human-readable reason for a non-verified status. */
+  detail?: string;
 }
 
 export interface Quote {

@@ -180,8 +180,9 @@ Two concrete adapters ship for each:
 
 | Adapter | Module constant | When to use |
 |---|---|---|
-| `InMemoryIntentsRepository` | `INTENTS_PERSISTENCE=memory` (default) | Development, tests — no database required |
-| `PrismaIntentsRepository` | `INTENTS_PERSISTENCE=prisma` | Production / staging — persists to the `intents` table |
+| `InMemoryIntentsRepository` | `INTENTS_STORE=memory` (default) | Development, tests — no database required |
+| `DualWriteIntentsRepository` | `INTENTS_STORE=dual` | Migration phase — memory reads, Postgres mirror, consistency verifier |
+| `PrismaIntentsRepository` | `INTENTS_STORE=postgres` | Production / staging — persists to the `intents` table |
 | `InMemorySolversRepository` | `SOLVERS_PERSISTENCE=memory` (default) | Development, tests |
 | `PrismaSolversRepository` | `SOLVERS_PERSISTENCE=prisma` | Production / staging — persists to the `solvers` table |
 
@@ -193,11 +194,14 @@ guarantee:
 
 - **In-memory adapter** — the Node.js event loop is single-threaded, so a
   plain state-guard read-then-write is atomic within a single process.
-- **Prisma adapter** — uses a single `prisma.intent.updateMany({
-  where: { intentId, state: 'open' }, data: ... })` call; the database
-  enforces the condition atomically.  A `count === 0` result means another
-  writer won the race.  This guarantee holds across multiple horizontally
-  scaled API instances.
+- **Prisma adapter** — every transition is one
+  `UPDATE intents SET … , version = version + 1 WHERE intent_id = $1 AND
+  state = 'open' [AND version = $2] RETURNING *` statement; the database
+  enforces the condition atomically. Zero rows means another writer won the
+  race (or, with an expected version, a `VersionConflict` — issue #405). This
+  guarantee holds across horizontally scaled API instances. The shared
+  contract suite (`src/intents/intents-repository.contract.ts`) runs against
+  every adapter.
 
 The `fillIfAccepted` path additionally guards on `solver === <address>` in
 the WHERE clause so a different solver can never accidentally fill another
@@ -205,7 +209,8 @@ solver's accepted intent.
 
 ### Switching adapters
 
-Set `INTENTS_PERSISTENCE=prisma` and `SOLVERS_PERSISTENCE=prisma` in your
+Set `INTENTS_STORE=postgres` (via `dual` — see
+`docs/runbooks/intents-store-migration.md`) and `SOLVERS_PERSISTENCE=prisma` in your
 environment (see the Docker production deployment section in `README.md`).
 `DATABASE_URL` must point to a running Postgres instance with migrations
 applied (`npm run db:migrate:prod`).  No code changes are required —
