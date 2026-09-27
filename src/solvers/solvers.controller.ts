@@ -12,8 +12,14 @@ import {
 } from "@nestjs/common";
 import { ApiOperation, ApiQuery, ApiTags } from "@nestjs/swagger";
 import { IntentsService } from "../intents/intents.service";
-import { buildDisputeMessage, verifyStellarSignature, buildSolverStatusMessage } from "../common/stellar-signature";
-import { SolversService, LeaderboardWindow } from "./solvers.service";
+import {
+  buildDisputeMessage,
+  buildRegisterMessage,
+  buildSolverStatusMessage,
+  verifyStellarSignature,
+} from "../common/stellar-signature";
+import { SolversService, LeaderboardWindow, solverSupports } from "./solvers.service";
+import { ListIntentsDto } from "../intents/dto/list-intents.dto";
 import { RegisterSolverDto } from "./dto/register-solver.dto";
 import { UpdateSolverStatusDto } from "./dto/update-solver-status.dto";
 

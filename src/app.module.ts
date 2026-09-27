@@ -10,6 +10,7 @@ import { StatsModule } from "./stats/stats.module";
 import { SorobanModule } from "./soroban/soroban.module";
 import { RoutingModule } from "./routing/routing.module";
 import { PrismaModule } from "./prisma/prisma.module";
+import { MetricsModule } from "./metrics/metrics.module";
 
 @Module({
   imports: [
@@ -23,6 +24,9 @@ import { PrismaModule } from "./prisma/prisma.module";
     ]),
     ConfigModule,
     PrismaModule,
+    // @Global, but must still be imported once for MetricsService to resolve
+    // (IntentsSweeperService and the intents store depend on it).
+    MetricsModule,
     HealthModule,
     TokensModule,
     IntentsModule,

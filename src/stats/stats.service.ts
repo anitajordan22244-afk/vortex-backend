@@ -7,7 +7,7 @@ import { IntentsGateway } from "../intents/intents.gateway";
 @Injectable()
 export class StatsService {
   private cachedProtocolStats:
-    | { expiresAt: number; value: ReturnType<StatsService["buildProtocolStats"]> }
+    | { expiresAt: number; value: Awaited<ReturnType<StatsService["getProtocolStats"]>> }
     | null = null;
 
   constructor(

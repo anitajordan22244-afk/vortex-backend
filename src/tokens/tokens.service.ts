@@ -1,5 +1,5 @@
-import { BadRequestException, Injectable } from "@nestjs/common";
-import { SUPPORTED_TOKENS, STELLAR_TOKENS, SourceToken, StellarToken } from "./tokens.data";
+import { BadRequestException, Inject, Injectable } from "@nestjs/common";
+import { SUPPORTED_TOKENS, StellarToken } from "./tokens.data";
 import { SupportedChain } from "../intents/intents.types";
 import { ITokensRepository, TOKENS_REPOSITORY, TokenRecord } from "./tokens.repository";
 
@@ -50,8 +50,8 @@ export class TokensService {
    * @param chain   The source chain (stellar | ethereum | base | …)
    * @param address Token contract/address string
    */
-  resolveSrcToken(chain: SupportedChain, address: string): ResolvedSrcToken | undefined {
-    const token = this.repo.findByAddressAndChain(address, chain);
+  async resolveSrcToken(chain: SupportedChain, address: string): Promise<ResolvedSrcToken | undefined> {
+    const token = await this.repo.findByAddressAndChain(address, chain);
     if (!token) return undefined;
     return {
       kind: "src",
@@ -69,8 +69,8 @@ export class TokensService {
    *
    * Returns `undefined` when no match is found.
    */
-  resolveDstToken(contract: string): ResolvedDstToken | undefined {
-    const token = this.repo.findByAddressAndChain(contract, "stellar");
+  async resolveDstToken(contract: string): Promise<ResolvedDstToken | undefined> {
+    const token = await this.repo.findByAddressAndChain(contract, "stellar");
     if (!token) return undefined;
     return {
       kind: "dst",
@@ -90,8 +90,8 @@ export class TokensService {
    * Use this on the write path (intent creation) where an unrecognised token
    * must be rejected outright rather than silently stored with no priceUSD.
    */
-  resolveSrcTokenOrThrow(chain: SupportedChain, address: string): ResolvedSrcToken {
-    const token = this.resolveSrcToken(chain, address);
+  async resolveSrcTokenOrThrow(chain: SupportedChain, address: string): Promise<ResolvedSrcToken> {
+    const token = await this.resolveSrcToken(chain, address);
     if (!token) {
       throw new BadRequestException(
         `Unknown source token '${address}' for chain '${chain}' in the configured token registry`,
@@ -105,8 +105,8 @@ export class TokensService {
    * returning `undefined` when the contract does not resolve to a known Stellar
    * token (issue #276).
    */
-  resolveDstTokenOrThrow(contract: string): ResolvedDstToken {
-    const token = this.resolveDstToken(contract);
+  async resolveDstTokenOrThrow(contract: string): Promise<ResolvedDstToken> {
+    const token = await this.resolveDstToken(contract);
     if (!token) {
       throw new BadRequestException(
         "Unknown destination token contract for the configured token registry",
@@ -115,7 +115,10 @@ export class TokensService {
     return token;
   }
 
-  getByChain(chain?: string) {
+  async getByChain(chain?: string) {
+    const records = await this.repo.findAll();
+    const stellarTokens = records.filter((t) => t.chain === "stellar");
+    const chainRecords = records.filter((t) => t.chain !== "stellar");
     if (chain === "stellar") {
       return { tokens: stellarTokens.map((t) => ({ ...t, contract: t.address })), chain: "stellar" };
     }
@@ -127,7 +130,7 @@ export class TokensService {
     }
     return {
       tokens: Object.fromEntries(
-        Object.entries(SUPPORTED_TOKENS).map(([key, _]) => [
+        Object.keys(SUPPORTED_TOKENS).map((key) => [
           key,
           chainRecords.filter((t) => t.chain === key).map((t) => ({ ...t, contract: t.address })),
         ]),

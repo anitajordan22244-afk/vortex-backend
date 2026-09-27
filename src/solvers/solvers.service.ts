@@ -5,6 +5,27 @@ import { SolverRecord, SolverPendingPenalty } from "./solvers.types";
 
 export type LeaderboardWindow = "24h" | "7d" | "30d" | "all";
 
+/** Profile fields a solver may change after registration (issue #273). */
+export type SolverProfilePatch = Partial<
+  Pick<SolverRecord, "name" | "avgFillTime" | "supportedChains" | "supportedTokens">
+>;
+
+/**
+ * Whether `solver` advertises support for `token` on `chain`
+ * (case-insensitive token match). Used to filter eligible intents.
+ */
+export function solverSupports(
+  solver: Pick<SolverRecord, "supportedChains" | "supportedTokens">,
+  chain: SupportedChain | string,
+  token: string,
+): boolean {
+  if (!solver.supportedChains.includes(chain as SupportedChain) && chain !== "*") {
+    return false;
+  }
+  const normalizedToken = token.toUpperCase();
+  return solver.supportedTokens.some((supportedToken) => supportedToken.toUpperCase() === normalizedToken);
+}
+
 export interface SlashDisputeRecord {
   submittedAt: number;
   reason: string;
@@ -99,6 +120,32 @@ export class SolversService {
     const solver = await this.repo.findByAddress(address);
     if (!solver) return null;
     const updated = { ...solver, isActive: true };
+    return this.repo.save(updated);
+  }
+
+  /**
+   * Apply a partial profile patch (issue #273). Only mutable profile fields
+   * are applied; `undefined` values are ignored rather than clearing data.
+   * Returns undefined for an unknown address.
+   */
+  async update(address: string, patch: SolverProfilePatch): Promise<SolverRecord | undefined> {
+    const solver = await this.repo.findByAddress(address);
+    if (!solver) return undefined;
+    const allowed: Array<keyof SolverProfilePatch> = ["name", "avgFillTime", "supportedChains", "supportedTokens"];
+    const changes = Object.fromEntries(
+      allowed.filter((key) => patch[key] !== undefined).map((key) => [key, patch[key]]),
+    ) as SolverProfilePatch;
+    return this.repo.save({ ...solver, ...changes });
+  }
+
+  /**
+   * Bumps lastActiveAt on a successful fill. Called by IntentsController.fill()
+   * after fillIfAccepted() succeeds.
+   */
+  async recordSuccessfulFill(address: string): Promise<SolverRecord | null> {
+    const solver = await this.repo.findByAddress(address);
+    if (!solver) return null;
+    const updated = { ...solver, lastActiveAt: Math.floor(Date.now() / 1000) };
     return this.repo.save(updated);
   }
 
