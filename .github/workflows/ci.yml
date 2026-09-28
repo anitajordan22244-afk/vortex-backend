@@ -169,8 +169,10 @@ jobs:
 
       # Same suite against the Postgres-backed intents store, including the
       # concurrency and POST /intents latency load tests (issue #404).
+      # --runInBand: suites share one database, so parallel workers would
+      # race on table-wide counts (e.g. the stats deltas).
       - name: E2E tests (INTENTS_STORE=postgres)
-        run: npm run test:e2e
+        run: npm run test:e2e -- --runInBand
         env:
           INTENTS_STORE: postgres
 
