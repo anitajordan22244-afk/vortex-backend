@@ -124,6 +124,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Anvil for the EVM deposit-verification integration test (issue #403,
+      # test/evm/deposit-verifier.anvil.test.ts — skipped when anvil is absent).
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+
       # ── Env drift check ────────────────────────────────────────────────────
       # Fast, early-failing check that env.validation.ts, .env*.example, and
       # configuration.ts's process.env reads all agree on the same variable set.

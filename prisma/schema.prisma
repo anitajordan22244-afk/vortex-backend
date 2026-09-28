@@ -77,6 +77,12 @@ model Intent {
   version        Int         @default(0) @map("version")
   /// Caller-supplied idempotency key for POST /intents; unique across replicas (issue #404).
   idempotencyKey String?     @unique @map("idempotency_key")
+  /// Source-chain escrow deposit confirmed (issue #403); unverified intents are not fillable.
+  srcVerified    Boolean     @default(false) @map("src_verified")
+  /// EVM deposit transaction hash supplied at creation, if any.
+  srcTxHash      String?     @map("src_tx_hash")
+  /// Last verification result: status, block, received amount, detail.
+  srcVerification Json?      @map("src_verification")
 
   @@index([user])
   @@index([state])

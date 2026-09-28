@@ -287,7 +287,7 @@ export class PrismaIntentsRepository implements IIntentsRepository {
     "id", "intent_id", "user", "src_chain", "src_token", "src_amount", "dst_token",
     "min_dst_amount", "quoted_dst_amount", "solver", "state", "created_at", "deadline",
     "filled_at", "fill_amount", "fee_amount", "tx_hash", "slashed_at", "slash_reason",
-    "version", "idempotency_key",
+    "version", "idempotency_key", "src_verified", "src_tx_hash", "src_verification",
   ];
 
   private insertColumns(): Prisma.Sql {
@@ -317,6 +317,9 @@ export class PrismaIntentsRepository implements IIntentsRepository {
       intent.slashReason ?? null,
       intent.version,
       idempotencyKey,
+      intent.srcVerified,
+      intent.srcTxHash ?? null,
+      intent.srcVerification ? Prisma.sql`${JSON.stringify(intent.srcVerification)}::jsonb` : null,
     ]);
   }
 
@@ -342,7 +345,7 @@ export class PrismaIntentsRepository implements IIntentsRepository {
       createdAt: row.created_at,
       deadline: row.deadline,
       version: row.version,
-      srcVerified: row.src_verified ?? true,
+      srcVerified: row.src_verified ?? false,
     };
     if (row.quoted_dst_amount !== null) intent.quotedDstAmount = row.quoted_dst_amount;
     if (row.solver !== null) intent.solver = row.solver;

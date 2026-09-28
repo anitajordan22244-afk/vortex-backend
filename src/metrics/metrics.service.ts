@@ -33,6 +33,11 @@ export class MetricsService implements OnModuleInit {
   public readonly contractUpgradesTotal: client.Counter<string>;
   public readonly contractWritesBlockedTotal: client.Counter<string>;
 
+  /** Source-chain deposit verification (issue #403). */
+  public readonly srcVerificationsTotal: client.Counter<string>;
+  public readonly srcVerificationErrorsTotal: client.Counter<string>;
+  public readonly srcVerificationQueueSize: client.Gauge<string>;
+
   constructor(private readonly configService: ConfigService<AppConfig, true>) {
     this.register = new client.Registry();
     const prefix = "vortex_";
@@ -134,6 +139,27 @@ export class MetricsService implements OnModuleInit {
       registers: [this.register],
     });
 
+    // ── Source-chain deposit verification (issue #403) ──────────────────────
+    this.srcVerificationsTotal = new client.Counter({
+      name: `${prefix}src_verifications_total`,
+      help: "Source-deposit verification outcomes, by chain and status",
+      labelNames: ["chain", "status"],
+      registers: [this.register],
+    });
+
+    this.srcVerificationErrorsTotal = new client.Counter({
+      name: `${prefix}src_verification_errors_total`,
+      help: "Source-deposit verification attempts that failed with an RPC error",
+      labelNames: ["chain", "reason"],
+      registers: [this.register],
+    });
+
+    this.srcVerificationQueueSize = new client.Gauge({
+      name: `${prefix}src_verification_queue_size`,
+      help: "Open intents awaiting (re-)verification of their source deposit",
+      registers: [this.register],
+    });
+
     this.contractWritesBlockedTotal = new client.Counter({
       name: `${prefix}contract_writes_blocked_total`,
       help: "On-chain writes refused because the contract version is unsupported",
@@ -200,5 +226,17 @@ export class MetricsService implements OnModuleInit {
 
   recordContractWriteBlocked(contract: string): void {
     this.contractWritesBlockedTotal.inc({ contract });
+  }
+
+  recordSrcVerification(chain: string, status: string): void {
+    this.srcVerificationsTotal.inc({ chain, status });
+  }
+
+  recordSrcVerificationError(chain: string, reason: "rate_limited" | "rpc_error"): void {
+    this.srcVerificationErrorsTotal.inc({ chain, reason });
+  }
+
+  setSrcVerificationQueueSize(size: number): void {
+    this.srcVerificationQueueSize.set(size);
   }
 }

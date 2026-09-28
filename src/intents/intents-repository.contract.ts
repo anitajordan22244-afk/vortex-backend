@@ -70,6 +70,9 @@ export function runIntentsRepositoryContract(
           feeAmount: "497",
           txHash: "abc123",
           version: 7,
+          srcVerified: false,
+          srcTxHash: "0x" + "ab".repeat(32),
+          srcVerification: { status: "pending", checkedAt: now, blockNumber: "123", blockHash: "0xhash", detail: "3/12 confirmations" },
         });
         await repo.save(intent);
         expect(await repo.findById(intent.intentId)).toEqual(intent);
@@ -113,6 +116,16 @@ export function runIntentsRepositoryContract(
     });
 
     describe("update(id, patch, expectedVersion)", () => {
+      it("patches source-verification fields (issue #403)", async () => {
+        const intent = await seeded({ srcVerified: false });
+        const verification = { status: "verified" as const, checkedAt: now, receivedAmount: "1000000" };
+        const updated = asIntent(
+          await repo.update(intent.intentId, { srcVerified: true, srcVerification: verification }, 0),
+        );
+        expect(updated).toMatchObject({ srcVerified: true, srcVerification: verification, version: 1 });
+        expect(await repo.findById(intent.intentId)).toMatchObject({ srcVerified: true, srcVerification: verification });
+      });
+
       it("applies the patch and increments the version", async () => {
         const intent = await seeded();
         const updated = asIntent(await repo.update(intent.intentId, { quotedDstAmount: "1" }, 0));

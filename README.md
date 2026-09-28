@@ -155,6 +155,7 @@ from those that are safe to leave at their testnet/dev defaults.
 | `SOROBAN_RPC_URL` | Yes | No | A production-grade Soroban RPC endpoint; the default points at the public testnet |
 | `INTENTS_STORE` | Yes — set to `postgres` | `memory` | `memory` loses all intents on restart and cannot scale horizontally. Promote via `dual` per [`docs/runbooks/intents-store-migration.md`](./docs/runbooks/intents-store-migration.md). `INTENTS_PERSISTENCE=prisma` is a deprecated alias for `postgres` |
 | `SOLVERS_PERSISTENCE` | Recommended | `memory` | Set to `prisma` to persist solver registry to Postgres; `memory` loses solver state on restart |
+| `EVM_DEPOSIT_VERIFICATION_ENABLED` | Yes — set to `true` | `false` | EVM-source intents are hidden from solvers until the escrow deposit is confirmed; needs `EVM_RPC_URLS` and `EVM_ESCROW_ADDRESSES`. See [`docs/runbooks/evm-deposit-verification.md`](./docs/runbooks/evm-deposit-verification.md) |
 | `SOROBAN_FEE_PERCENTILE` | Recommended | `p50` | Raise to `p90` on mainnet for better confirmation speed under load |
 | `WS_MAX_CONNECTIONS` | Recommended | `1000` | Tune to expected solver + frontend connection count |
 | `SENTRY_DSN` | Recommended | — (Sentry disabled) | Set to your Sentry project DSN for error alerting |
@@ -196,8 +197,10 @@ versus **planned** (schema/token data in place, on-chain settlement pending).
 | Optimism | 🔲 Planned | Token registry populated; on-chain integration not yet implemented |
 | Avalanche | 🔲 Planned | Token registry populated; on-chain integration not yet implemented |
 
-> **Contributor note:** EVM chains are accepted in the intent DTO and stored
-> in-memory, but no on-chain settlement or bridging logic is wired up yet.
+> **Contributor note:** EVM chains are accepted in the intent DTO. With
+> `EVM_DEPOSIT_VERIFICATION_ENABLED=true` the backend confirms the user's
+> escrow deposit (`src/chains/evm/`) before the intent is offered to solvers;
+> no settlement or bridging logic is wired up yet.
 > See [`docs/architecture/onchain-settlement.md`](./docs/architecture/onchain-settlement.md)
 > for the target design.
 

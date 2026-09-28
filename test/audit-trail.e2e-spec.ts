@@ -5,7 +5,7 @@ import { createTestApp } from "./utils/create-test-app";
 import { IntentsService } from "../src/intents/intents.service";
 import { buildCancelMessage, verifyStellarSignature } from "../src/common/stellar-signature";
 
-const USER_KP = Keypair.fromSecret("SCZANGBA5YELHNOHPQLUIZ6MFJLCVX5BPXTBXCMD5SBKX60RCVHQQHK");
+const USER_KP = Keypair.random();
 
 function sign(kp: Keypair, msg: string): string {
   const msgBuf = Buffer.from(msg, "utf8");

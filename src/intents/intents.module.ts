@@ -9,6 +9,8 @@ import { PrismaIntentsRepository } from "./prisma-intents.repository";
 import { DualWriteIntentsRepository } from "./dual-write-intents.repository";
 import { IntentsStoreVerifierService } from "./intents-store-verifier.service";
 import { MetricsService } from "../metrics/metrics.service";
+import { EvmModule } from "../chains/evm/evm.module";
+import { SourceDepositVerificationService } from "./source-deposit-verification.service";
 import { SolversModule } from "../solvers/solvers.module";
 import { RoutingModule } from "../routing/routing.module";
 import { TokensModule } from "../tokens/tokens.module";
@@ -18,7 +20,7 @@ import { AppConfig } from "../config/configuration";
 import { PrismaService } from "../prisma/prisma.service";
 
 @Module({
-  imports: [forwardRef(() => SolversModule), RoutingModule, TokensModule, forwardRef(() => SorobanModule)],
+  imports: [forwardRef(() => SolversModule), RoutingModule, TokensModule, forwardRef(() => SorobanModule), EvmModule],
   controllers: [IntentsController],
   providers: [
     // Select the intents store from INTENTS_STORE (issue #404):
@@ -52,6 +54,7 @@ import { PrismaService } from "../prisma/prisma.service";
     IntentsGateway,
     IntentsSweeperService,
     IntentsStoreVerifierService,
+    SourceDepositVerificationService,
     EventIngestionService,
   ],
   exports: [IntentsService, IntentsGateway],

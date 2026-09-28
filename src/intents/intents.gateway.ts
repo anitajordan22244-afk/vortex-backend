@@ -267,7 +267,9 @@ export class IntentsGateway
     // immediately after the "connected" message.
     Promise.resolve(this.intentsService.getByState("open"))
       .then((open) => {
-        client.send(JSON.stringify({ type: "snapshot", intents: open.slice(0, 20), seq: currentSeq }));
+        // Only fillable intents: unverified source deposits are hidden (issue #403).
+        const fillable = open.filter((i) => i.srcVerified);
+        client.send(JSON.stringify({ type: "snapshot", intents: fillable.slice(0, 20), seq: currentSeq }));
       })
       .catch(() => {
         /* snapshot failure is non-fatal — client can re-fetch via REST */

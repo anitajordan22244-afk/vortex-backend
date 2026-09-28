@@ -29,6 +29,13 @@ function makeConfigService(
     intentsVerifyIntervalMs: 60000,
     intentRetentionDays: 30,
     intentRetentionSweepMs: 60000,
+    evm: {
+      depositVerificationEnabled: false,
+      rpcUrls: {},
+      escrowAddresses: {},
+      transferFeeToleranceBps: 0,
+      logLookbackBlocks: 10000,
+    },
     // Default to dry-run true for tests (safe default)
     onchainDryRun: appOverrides.onchainDryRun ?? true,
     corsOrigin: "*",

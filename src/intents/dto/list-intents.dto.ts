@@ -1,4 +1,5 @@
-import { IsIn, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
+import { Transform, Type } from "class-transformer";
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import {
   INTENT_STATES,
@@ -31,6 +32,7 @@ export class ListIntentsDto {
 
   @ApiPropertyOptional({ minimum: 1, maximum: 100, default: 20, description: "Number of results per page" })
   @IsOptional()
+  @Type(() => Number) // query strings arrive as text
   @IsInt()
   @Min(1)
   @Max(100)
@@ -41,8 +43,20 @@ export class ListIntentsDto {
   @IsString()
   cursor?: string;
 
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      "GET /intents/open only: include intents whose source-chain deposit is not yet verified " +
+      "(issue #403). Unverified intents cannot be accepted.",
+  })
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === "true" || value === "1")
+  @IsBoolean()
+  includeUnverified?: boolean;
+
   @ApiPropertyOptional({ minimum: 0, default: 0, description: "Number of results to skip" })
   @IsOptional()
+  @Type(() => Number)
   @IsInt()
   @Min(0)
   offset?: number;

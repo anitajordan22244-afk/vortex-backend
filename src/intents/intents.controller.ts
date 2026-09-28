@@ -106,8 +106,15 @@ export class IntentsController {
   }
 
   @Get("open")
+  @ApiOperation({
+    summary: "List open intents available to solvers",
+    description:
+      "Only intents whose source-chain deposit is verified are returned by default (issue #403); " +
+      "pass includeUnverified=true to see intents still awaiting verification.",
+  })
   async listOpen(@Query() dto: ListIntentsDto) {
-    const open = await this.intentsService.getByState("open");
+    const allOpen = await this.intentsService.getByState("open");
+    const open = dto.includeUnverified ? allOpen : allOpen.filter((i) => i.srcVerified);
     const limit = Math.min(dto.limit ?? 20, 100);
     const offset = dto.offset ?? 0;
 
@@ -253,6 +260,7 @@ export class IntentsController {
           priceUSD: srcToken?.priceUSD,
         },
         srcAmount: dto.srcAmount,
+        ...(dto.srcTxHash ? { srcTxHash: dto.srcTxHash.toLowerCase() } : {}),
         dstToken: {
           contract: dto.dstTokenContract,
           symbol: dto.dstTokenSymbol,
@@ -300,7 +308,7 @@ export class IntentsController {
   @ApiHeader(IF_MATCH_HEADER)
   @ApiOkResponse({ description: "The accepted intent", headers: ETAG_RESPONSE_HEADER })
   @ApiNotFoundResponse({ description: "Intent not found" })
-  @ApiConflictResponse({ description: "Intent is not in open state" })
+  @ApiConflictResponse({ description: "Intent is not in open state, or its source deposit is not verified" })
   @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
   @ApiGoneResponse({ description: "Intent has expired" })
   @ApiForbiddenResponse({ description: "Solver not registered or inactive" })
@@ -313,6 +321,12 @@ export class IntentsController {
     const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
+
+    // Issue #403: solvers must not take on an intent whose source funds are
+    // unproven — checked before the deadline so the error is actionable.
+    if (intent.state === "open" && !intent.srcVerified) {
+      throw new ConflictException("Intent source-chain deposit is not verified yet; it cannot be accepted");
+    }
 
     const now = Math.floor(Date.now() / 1000);
     if (intent.deadline <= now) {

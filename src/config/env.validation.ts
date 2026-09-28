@@ -5,6 +5,19 @@ import * as Joi from "joi";
 // it does not by itself prove the key is a *real, funded* signer.
 const STELLAR_SECRET_KEY_PATTERN = /^S[A-Z2-7]{55}$/;
 
+/** Joi custom validator: value must be a JSON object whose values are strings. */
+function jsonStringMap(value: string): string {
+  if (value === "") return value;
+  const parsed: unknown = JSON.parse(value); // throws → Joi reports the error
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("must be a JSON object");
+  }
+  for (const [key, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v !== "string") throw new Error(`value for "${key}" must be a string`);
+  }
+  return value;
+}
+
 export const envValidationSchema = Joi.object({
   NODE_ENV: Joi.string().valid("development", "production", "test").default("development"),
   PORT: Joi.number().port().default(4000),
@@ -145,6 +158,19 @@ export const envValidationSchema = Joi.object({
       }),
       otherwise: Joi.boolean().default(true),
     }),
+
+  // ── Source-chain deposit verification (issue #403) ───────────────────────
+  // When enabled, intents from EVM chains stay hidden from solvers
+  // (srcVerified=false) until the escrow's Deposited log is found with the
+  // chain's confirmation depth. See docs/runbooks/evm-deposit-verification.md.
+  EVM_DEPOSIT_VERIFICATION_ENABLED: Joi.boolean().default(false),
+  // JSON maps keyed by chain name, e.g. {"ethereum":"https://…","base":"https://…"}.
+  EVM_RPC_URLS: Joi.string().allow("").custom(jsonStringMap, "JSON map of chain → URL").default(""),
+  EVM_ESCROW_ADDRESSES: Joi.string().allow("").custom(jsonStringMap, "JSON map of chain → address").default(""),
+  // Allowed shortfall for fee-on-transfer tokens, in basis points (0 = exact).
+  EVM_TRANSFER_FEE_TOLERANCE_BPS: Joi.number().integer().min(0).max(10000).default(0),
+  // Blocks searched for the Deposited log when an intent has no srcTxHash.
+  EVM_LOG_LOOKBACK_BLOCKS: Joi.number().integer().min(1).default(10000),
 
   // ── Reference solver bot (scripts/solver-bot.ts) ─────────────────────────
   // Not read by the server; validated here so .env files shared with the bot

@@ -11,7 +11,7 @@ import {
 } from "../src/common/stellar-signature";
 
 // Known user keypair whose public key is a valid Stellar G… address
-const USER_KP = Keypair.fromSecret("SCZANGBA5YELHNOHPQLUIZ6MFJLCVX5BPXTBXCMD5SBKX60RCVHQQHK");
+const USER_KP = Keypair.random();
 const ALPHA_KP = SEED_SOLVER_KEYPAIRS.ALPHA;
 const BETA_KP = SEED_SOLVER_KEYPAIRS.BETA;
 

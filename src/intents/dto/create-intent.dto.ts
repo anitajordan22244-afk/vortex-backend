@@ -105,4 +105,14 @@ export class CreateIntentDto {
   @IsOptional()
   @IsString()
   idempotencyKey?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "EVM transaction hash of the escrow deposit (issue #403). Optional: when supplied, verification " +
+      "reads that receipt directly instead of scanning recent blocks for the Deposited log.",
+    example: "0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060",
+  })
+  @IsOptional()
+  @Matches(/^0x[0-9a-fA-F]{64}$/, { message: "srcTxHash must be a 0x-prefixed 32-byte transaction hash" })
+  srcTxHash?: string;
 }

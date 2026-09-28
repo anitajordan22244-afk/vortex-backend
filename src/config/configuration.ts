@@ -87,6 +87,39 @@ export function resolveIntentsStore(env: NodeJS.ProcessEnv = process.env): Inten
   return env.INTENTS_PERSISTENCE === "prisma" ? "postgres" : "memory";
 }
 
+/** Source-chain deposit verification settings (issue #403). */
+export interface EvmVerificationConfig {
+  /** When false, new intents are marked srcVerified immediately (status "skipped"). */
+  depositVerificationEnabled: boolean;
+  /** Per-chain JSON-RPC URL, e.g. { "ethereum": "https://…" }. */
+  rpcUrls: Partial<Record<string, string>>;
+  /** Per-chain escrow contract address emitting `Deposited`. */
+  escrowAddresses: Partial<Record<string, string>>;
+  /**
+   * Maximum shortfall between the escrow's received amount and srcAmount, in
+   * basis points — accommodates fee-on-transfer tokens. 0 = exact.
+   */
+  transferFeeToleranceBps: number;
+  /** How far back to search for the Deposited log when no srcTxHash is given. */
+  logLookbackBlocks: number;
+}
+
+/** Parse a JSON object env var of string values; invalid input yields {}. */
+export function parseJsonMap(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
 export interface AppConfig {
   nodeEnv: string;
   port: number;
@@ -117,6 +150,7 @@ export interface AppConfig {
   intentsVerifyIntervalMs: number;
   intentRetentionDays: number;
   intentRetentionSweepMs: number;
+  evm: EvmVerificationConfig;
   /**
    * Dry-run flag for on-chain write paths (issue #260).
    *
@@ -157,6 +191,13 @@ export default (): AppConfig => ({
   intentsVerifyIntervalMs: parseInt(process.env.INTENTS_VERIFY_INTERVAL_MS ?? "60000", 10),
   intentRetentionDays: parseInt(process.env.INTENT_RETENTION_DAYS ?? "30", 10),
   intentRetentionSweepMs: parseInt(process.env.INTENT_RETENTION_SWEEP_MS ?? "60000", 10),
+  evm: {
+    depositVerificationEnabled: (process.env.EVM_DEPOSIT_VERIFICATION_ENABLED ?? "false") === "true",
+    rpcUrls: parseJsonMap(process.env.EVM_RPC_URLS),
+    escrowAddresses: parseJsonMap(process.env.EVM_ESCROW_ADDRESSES),
+    transferFeeToleranceBps: parseInt(process.env.EVM_TRANSFER_FEE_TOLERANCE_BPS ?? "0", 10),
+    logLookbackBlocks: parseInt(process.env.EVM_LOG_LOOKBACK_BLOCKS ?? "10000", 10),
+  },
   // Default to dry-run (true) outside production; in production the value must
   // be explicitly set (validated by envValidationSchema).
   onchainDryRun: process.env.ONCHAIN_DRY_RUN !== undefined

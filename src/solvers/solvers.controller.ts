@@ -134,7 +134,7 @@ export class SolversController {
 
     const open = await this.intentsService.getByState("open");
     const eligible = open.filter((intent) =>
-      solverSupports(solver, intent.srcChain, intent.srcToken.symbol),
+      intent.srcVerified && solverSupports(solver, intent.srcChain, intent.srcToken.symbol),
     );
 
     const limit = Math.min(dto.limit ?? 20, 100);

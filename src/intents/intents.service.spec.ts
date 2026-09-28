@@ -416,6 +416,7 @@ describe("IntentsService", () => {
           deadline: 0,
           version: 0,
           srcVerified: true,
+          srcVerification: {},
         }).sort(),
       );
       expect(await service.get(intent.intentId)).toBeDefined();

@@ -23,6 +23,7 @@ import {
   DEFAULT_FILL_WINDOW_SECONDS,
 } from "../config/configuration";
 import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { isEvmSourceChain } from "../chains/evm/evm-chains";
 import { ContractVersionUnsupportedException } from "../soroban/contract-version.service";
 import { PrismaService } from "../prisma/prisma.service";
 
@@ -211,7 +212,7 @@ export class IntentsService implements OnModuleDestroy {
       deadline:
         data.deadline ?? now + (CHAIN_DEADLINE_DEFAULTS[data.srcChain] ?? DEFAULT_DEADLINE_SECONDS),
       version: 0,
-      srcVerified: true,
+      ...this.initialSrcVerification(data.srcChain, now),
     };
 
     if (this.configService.get("onchainIntentsEnabled", { infer: true })) {
@@ -219,6 +220,28 @@ export class IntentsService implements OnModuleDestroy {
     }
 
     return intent;
+  }
+
+  /**
+   * Issue #403: with EVM_DEPOSIT_VERIFICATION_ENABLED, intents from EVM
+   * chains start unverified — hidden from GET /intents/open and not
+   * acceptable — until SourceDepositVerificationService confirms the escrow
+   * deposit. Stellar-source intents, and every intent while the flag is off,
+   * are marked verified with status "skipped".
+   */
+  private initialSrcVerification(srcChain: Intent["srcChain"], now: number): Pick<Intent, "srcVerified" | "srcVerification"> {
+    const enabled = this.configService.get("evm", { infer: true })?.depositVerificationEnabled === true;
+    if (enabled && isEvmSourceChain(srcChain)) {
+      return { srcVerified: false, srcVerification: { status: "pending", checkedAt: now } };
+    }
+    return {
+      srcVerified: true,
+      srcVerification: {
+        status: "skipped",
+        checkedAt: now,
+        detail: enabled ? "non-EVM source chain" : "deposit verification disabled",
+      },
+    };
   }
 
   /**
