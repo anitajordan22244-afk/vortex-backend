@@ -8,6 +8,7 @@ import {
 } from "./event-ingestion.service";
 import { SorobanService } from "./soroban.service";
 import { SolversService } from "../solvers/solvers.service";
+import { LeaderElectionService } from "../common/leader-election";
 import { Contract, StrKey } from "@stellar/stellar-sdk";
 import { ContractVersionService } from "./contract-version.service";
 
@@ -15,6 +16,19 @@ function fakeSolversService(): SolversService {
   return {
     confirmPenalty: jest.fn().mockResolvedValue(null),
   } as unknown as SolversService;
+}
+
+/** Minimal no-op LeaderElectionService for unit tests. */
+function noopLeaderElection(): LeaderElectionService {
+  return {
+    registerWorker: jest.fn(),
+    isLeader: jest.fn().mockReturnValue(true),
+    getState: jest.fn().mockReturnValue(null),
+    getAllStates: jest.fn().mockReturnValue({}),
+    onModuleInit: jest.fn(),
+    onModuleDestroy: jest.fn(),
+    runHeartbeatOnce: jest.fn().mockResolvedValue(undefined),
+  } as unknown as LeaderElectionService;
 }
 
 function makeIntentFilledEvent(
@@ -73,7 +87,7 @@ describe("EventIngestionService", () => {
 
     beforeEach(() => {
       sorobanService = {} as SorobanService;
-      service = new EventIngestionService(sorobanService, makeConfigService(), fakeSolversService());
+      service = new EventIngestionService(sorobanService, makeConfigService(), fakeSolversService(), noopLeaderElection());
     });
 
     it("processes a new event exactly once", () => {
@@ -149,6 +163,9 @@ describe("EventIngestionService", () => {
         { getEvents, getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1 }) } as unknown as SorobanService,
         makeConfigService("CSETTLEMENT", REGISTRY_ID),
         fakeSolversService(),
+        undefined, // metrics
+        undefined, // intents
+        noopLeaderElection(),
         versions as unknown as ContractVersionService,
       );
       return { service, versions, getEvents };

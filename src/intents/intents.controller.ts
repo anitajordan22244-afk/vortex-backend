@@ -25,6 +25,7 @@ import {
   ApiBadRequestResponse,
   ApiTooManyRequestsResponse,
   ApiOperation,
+  ApiServiceUnavailableResponse,
   ApiHeader,
   ApiPreconditionFailedResponse,
 } from "@nestjs/swagger";
@@ -59,6 +60,16 @@ import {
   varianceScaleFromPerfScore,
 } from "../common/amount";
 import { Intent, SupportedChain } from "./intents.types";
+import {
+  assertNotPaused,
+  KillSwitchGate,
+  KillSwitchGuard,
+} from "../killswitch/killswitch.guard";
+import { KillSwitchService } from "../killswitch/killswitch.service";
+import { KillSwitchOperation } from "../killswitch/killswitch.types";
+import { ConfigService } from "@nestjs/config";
+import { AppConfig } from "../config/configuration";
+import { isCanaryIntent } from "../common/canary";
 import { isVersionConflict, MutationResult, VersionConflict } from "./intents.repository";
 import { etagFor, parseIfMatch, preconditionFailed } from "./etag";
 
@@ -71,7 +82,7 @@ const IF_MATCH_HEADER = {
     "mutation only applies if the intent is still at that version; otherwise 412.",
 };
 const ETAG_RESPONSE_HEADER = {
-  ETag: { description: "Current intent version as a strong entity tag, e.g. \"3\"", schema: { type: "string" } },
+  ETag: { description: 'Current intent version as a strong entity tag, e.g. "3"', schema: { type: "string" } },
 };
 
 @ApiTags("intents")
@@ -83,7 +94,38 @@ export class IntentsController {
     private readonly intentsGateway: IntentsGateway,
     private readonly tokensService: TokensService,
     private readonly routingService: RoutingService,
-  ) {}
+    private readonly killSwitch: KillSwitchService,
+    config: ConfigService<AppConfig, true>,
+  ) {
+    this.canary = new Set(config.get("canaryAddresses", { infer: true }) ?? []);
+  }
+
+  /** Canary addresses (issue #496). */
+  private readonly canary: ReadonlySet<string>;
+
+  /**
+   * Re-assert the kill-switch hierarchy against a *loaded* intent.
+   *
+   * `KillSwitchGuard` runs before the handler and can only read the route path
+   * and body. For `:id` routes that is not enough to evaluate a chain- or
+   * token-scoped pause, so `accept` and `fill` call this once the record is in
+   * hand. The global-scope and snapshot-readiness checks are still done by the
+   * guard, so this is strictly additional coverage, not a replacement.
+   */
+  private assertIntentNotPaused(intent: Intent, operation: KillSwitchOperation): void {
+    assertNotPaused(
+      this.killSwitch,
+      {
+        chain: intent.srcChain,
+        // Prefer the contract address: symbols are not unique within a chain,
+        // so a symbol-scoped pause would over-match and an address-scoped one
+        // would under-match. Operators pause by address.
+        token: intent.srcToken?.address ?? null,
+        operation,
+      },
+      { retryAfterSeconds: 30 },
+    );
+  }
 
   @Get()
   @ApiBadRequestResponse({ description: "Invalid limit or offset" })
@@ -226,7 +268,8 @@ export class IntentsController {
    * Issue #45 — additionally throttle per dto.user: 10 creates / 60 s.
    */
   @Post()
-  @UseGuards(UserThrottlerGuard)
+  @UseGuards(UserThrottlerGuard, KillSwitchGuard)
+  @KillSwitchGate({ operation: "create" })
   @ApiTooManyRequestsResponse({
     description:
       "Rate limit exceeded — max 10 intent creations per user per 60 s (or 100 req/min per IP globally)",
@@ -241,6 +284,16 @@ export class IntentsController {
     // #219: use typed resolveToken instead of ad-hoc duck-typed any casts.
     // #276: reject unrecognised tokens outright instead of silently creating an
     // intent whose priceUSD defaults to undefined.
+    // #473: enforce the per-user open-intent cap as a fast-path rejection.
+    // The atomic guarantee lives in the persistence layer (conditional write);
+    // this pre-check keeps the common over-cap case cheap without adding a
+    // round trip on the happy path.
+    const openCount = await this.intentsService.countOpenByUser(dto.user);
+    if (openCount >= MAX_OPEN_INTENTS_PER_USER) {
+      throw new ConflictException(
+        `Open-intent cap reached — max ${MAX_OPEN_INTENTS_PER_USER} open/accepted intents per user`,
+      );
+    }
     const srcToken = await this.tokensService.resolveSrcTokenOrThrow(
       dto.srcChain as SupportedChain,
       dto.srcTokenAddress,
@@ -305,6 +358,8 @@ export class IntentsController {
   }
 
   @Post(":id/accept")
+  @UseGuards(KillSwitchGuard)
+  @KillSwitchGate({ operation: "accept" })
   @ApiHeader(IF_MATCH_HEADER)
   @ApiOkResponse({ description: "The accepted intent", headers: ETAG_RESPONSE_HEADER })
   @ApiNotFoundResponse({ description: "Intent not found" })
@@ -319,8 +374,17 @@ export class IntentsController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const expectedVersion = parseIfMatch(ifMatch);
+    // Fast-path snapshot only — guards below are advisory. The atomic
+    // decision is the conditional `acceptIfOpen` write (state=open AND
+    // deadline > now in SQL), so a concurrent cancel/expiry always wins.
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
+
+    // The guard above can only see the path parameter, so it could not know
+    // which chain/token this intent belongs to. Re-assert now that the record
+    // is loaded, otherwise a chain- or token-scoped pause would not stop
+    // accepts. Deliberately placed after the 404 so an unknown id still 404s.
+    this.assertIntentNotPaused(intent, "accept");
 
     // Issue #403: solvers must not take on an intent whose source funds are
     // unproven — checked before the deadline so the error is actionable.
@@ -330,8 +394,8 @@ export class IntentsController {
 
     const now = Math.floor(Date.now() / 1000);
     if (intent.deadline <= now) {
-      // Only an intent that is still open can lapse to expired here; the
-      // conditional write leaves any concurrent transition untouched.
+      // Atomic expiry attempt: never blindly overwrite — an `accepted`
+      // intent must slash, never expire (issue #473).
       await this.intentsService.expireIfOpen(id);
       throw new GoneException("Intent has expired");
     }
@@ -346,17 +410,29 @@ export class IntentsController {
     if (!solver.bondAmount || BigInt(solver.bondAmount) <= 0n) {
       throw new ForbiddenException("Solver has insufficient bond");
     }
+    if (this.solversService.isSuspended(dto.solver)) {
+      throw new ForbiddenException("Solver is suspended by an active guardian action");
+    }
+    // Canary intents pair only with canary solvers (issue #496) so synthetic
+    // traffic never affects real solvers' stats or real users' fills.
+    if (isCanaryIntent(intent, this.canary) !== this.canary.has(dto.solver)) {
+      throw new ForbiddenException("Canary intents may only be accepted by canary solvers, and vice versa");
+    }
 
-    // Verify the solver controls the claimed address (mirrors fill()/cancel()).
-    verifyStellarSignature(dto.solver, buildAcceptMessage(id, dto.solver), dto.signature);
-
-    const updated = this.unwrap(await this.intentsService.acceptIfOpen(id, dto.solver, expectedVersion));
+    const updated = this.unwrap(await this.intentsService.acceptIfOpen(id, dto.solver, now, expectedVersion));
     if (!updated) {
       const current = await this.intentsService.get(id);
+      if (!current) throw new NotFoundException("Intent not found");
+      if ((current.deadline ?? 0) <= Math.floor(Date.now() / 1000)) {
+        throw new GoneException("Intent has expired");
+      }
       throw new ConflictException(`Intent is ${current?.state ?? "unknown"}, cannot accept`);
     }
-    res.setHeader("ETag", etagFor(updated));
 
+    res.setHeader("ETag", etagFor(updated));
+    this.intentsService.appendAuditEntry(id, "accepted", dto.solver, "solver accepted", {
+      deadline: updated.deadline,
+    });
     this.intentsGateway.broadcast({
       type: "intent_accepted",
       intentId: id,
@@ -366,14 +442,19 @@ export class IntentsController {
   }
 
   @Post(":id/fill")
-  @ApiHeader(IF_MATCH_HEADER)
-  @ApiOkResponse({ description: "The filled intent", headers: ETAG_RESPONSE_HEADER })
-  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
+  @UseGuards(KillSwitchGuard)
+  @KillSwitchGate({ operation: "fill" })
   @ApiNotFoundResponse({ description: "Intent not found" })
+  @ApiServiceUnavailableResponse({
+    description: "An emergency kill-switch is active for this intent's scope (503 + Retry-After)",
+  })
   @ApiConflictResponse({ description: "Intent is not in accepted state" })
   @ApiForbiddenResponse({ description: "Wrong solver for this intent" })
   @ApiGoneResponse({ description: "Fill window has expired" })
   @ApiBadRequestResponse({ description: "Fill amount below minimum" })
+  @ApiHeader(IF_MATCH_HEADER)
+  @ApiOkResponse({ description: "The filled intent", headers: ETAG_RESPONSE_HEADER })
+  @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
   async fill(
     @Param("id") id: string,
     @Body() dto: FillIntentDto,
@@ -383,6 +464,10 @@ export class IntentsController {
     const expectedVersion = parseIfMatch(ifMatch);
     const intent = await this.intentsService.get(id);
     if (!intent) throw new NotFoundException("Intent not found");
+
+    // Same reason as in `accept`: the route guard cannot resolve the intent's
+    // chain/token from `:id`, so re-assert against the loaded record.
+    this.assertIntentNotPaused(intent, "fill");
 
     const now = Math.floor(Date.now() / 1000);
     if (intent.deadline <= now) {
@@ -423,6 +508,7 @@ export class IntentsController {
           feeAmount: feeAmount.toString(),
           txHash: dto.txHash,
         },
+        now,
         expectedVersion,
       ),
     );
@@ -437,6 +523,10 @@ export class IntentsController {
     res.setHeader("ETag", etagFor(updated));
     await this.solversService.recordSuccessfulFill(dto.solver);
 
+    this.intentsService.appendAuditEntry(id, "filled", dto.solver, "solver filled", {
+      fillAmount: dto.fillAmount,
+      txHash: dto.txHash,
+    });
     this.intentsGateway.broadcast({
       type: "intent_filled",
       intentId: id,
@@ -504,13 +594,14 @@ export class IntentsController {
     // when a token identifier IS supplied it must resolve — otherwise the quote
     // engine would silently substitute a fake $1 price.
     const srcToken = dto.srcTokenAddress
-      ? await this.tokensService.resolveSrcTokenOrThrow(dto.srcChain as SupportedChain, dto.srcTokenAddress)
+      ? await this.tokensService.resolveSrcTokenOrThrow(
+          dto.srcChain as SupportedChain,
+          dto.srcTokenAddress,
+        )
       : undefined;
     const dstToken = dto.dstTokenContract
       ? await this.tokensService.resolveDstTokenOrThrow(dto.dstTokenContract)
       : undefined;
-
-    const targetIntent = dto.intentId ? await this.intentsService.get(dto.intentId) : undefined;
 
     const srcAmountBigInt = parseBaseUnits(dto.srcAmount);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -579,11 +670,12 @@ export class IntentsController {
           route,
         };
       })
+      // nosemgrep: no-number-money -- sort comparator on bounded quote diffs only; amounts stay strings elsewhere.
       .sort((a, b) => Number(BigInt(b.dstAmount) - BigInt(a.dstAmount)));
 
-    if (targetIntent && quotes.length > 0) {
+    if (dto.intentId && quotes.length > 0) {
       // Persisting the best quote is safe to retry on a version conflict.
-      await this.intentsService.mutateWithRetry(targetIntent.intentId, (current) =>
+      await this.intentsService.mutateWithRetry(dto.intentId, (current) =>
         this.intentsService.update(current.intentId, { quotedDstAmount: quotes[0].dstAmount }, current.version),
       );
     }
@@ -616,9 +708,9 @@ export class IntentsController {
     description: "Rate limit exceeded — max 20 quote requests per 60 s per IP",
   })
   @ApiOkResponse({ type: QuoteResponseDto })
-  @ApiHeader(IF_MATCH_HEADER)
   @ApiNotFoundResponse({ description: "Intent not found" })
   @ApiConflictResponse({ description: "Intent is not in the open state" })
+  @ApiHeader(IF_MATCH_HEADER)
   @ApiPreconditionFailedResponse({ description: "If-Match does not match the current intent version" })
   async requote(
     @Param("id") id: string,
@@ -694,6 +786,7 @@ export class IntentsController {
           route,
         };
       })
+      // nosemgrep: no-number-money -- sort comparator on bounded quote diffs only; amounts stay strings elsewhere.
       .sort((a, b) => Number(BigInt(b.dstAmount) - BigInt(a.dstAmount)));
 
     if (quotes.length > 0) {

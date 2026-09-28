@@ -2,6 +2,7 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { ConfigService } from "@nestjs/config";
 import { Keypair } from "@stellar/stellar-sdk";
 import { IntentsSweeperService } from "./intents-sweeper.service";
+import { KillSwitchService } from "../killswitch/killswitch.service";
 import { IntentsService } from "./intents.service";
 import { IntentsGateway } from "./intents.gateway";
 import { SolversService } from "../solvers/solvers.service";
@@ -10,9 +11,24 @@ import { MetricsService } from "../metrics/metrics.service";
 import { InMemorySolversRepository } from "../solvers/in-memory-solvers.repository";
 import { SOLVERS_REPOSITORY } from "../solvers/solvers.repository";
 import { InMemoryIntentsRepository } from "./intents.repository";
-import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { StellarTxService } from "../soroban/stellar-tx.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { AppConfig } from "../config/configuration";
+import { ProtocolParamsService } from "../governance/params.service";
+import { LeaderElectionService } from "../common/leader-election";
+
+/** Minimal no-op LeaderElectionService for tests that don't exercise election. */
+function noopLeaderElection(): LeaderElectionService {
+  return {
+    registerWorker: jest.fn(),
+    isLeader: jest.fn().mockReturnValue(true),
+    getState: jest.fn().mockReturnValue(null),
+    getAllStates: jest.fn().mockReturnValue({}),
+    onModuleInit: jest.fn(),
+    onModuleDestroy: jest.fn(),
+    runHeartbeatOnce: jest.fn().mockResolvedValue(undefined),
+  } as unknown as LeaderElectionService;
+}
 
 /** Use a stable test address (does not need to be a real funded key). */
 const ALPHA_KEYPAIR = Keypair.random();
@@ -22,7 +38,7 @@ function buildIntentsService(): IntentsService {
   const configService = {
     get: jest.fn().mockReturnValue(false),
   } as unknown as ConfigService<AppConfig, true>;
-  const stellarTxService = {} as SettlementContractClient;
+  const stellarTxService = {} as StellarTxService;
   const prismaService = {
     intentAuditLog: {
       create: jest.fn().mockResolvedValue({}),
@@ -32,7 +48,10 @@ function buildIntentsService(): IntentsService {
   const repo = new InMemoryIntentsRepository();
   // Clear seed data so tests start with a clean slate
   (repo as unknown as { store: Map<string, unknown> }).store.clear();
-  return new IntentsService(repo, configService, stellarTxService, prismaService);
+  const protocolParams = {
+    snapshotForChain: jest.fn().mockReturnValue({ version: 0, feeBps: 30, deadlineSeconds: 1800, fillWindowSeconds: 600, capturedAt: new Date().toISOString() }),
+  } as unknown as ProtocolParamsService;
+  return new IntentsService(repo, configService, stellarTxService, prismaService, protocolParams);
 }
 
 async function buildSolversService(): Promise<SolversService> {
@@ -51,6 +70,7 @@ describe("IntentsSweeperService", () => {
   let solversService: SolversService;
   let solverRegistryService: jest.Mocked<SolverRegistryService>;
   let metricsService: jest.Mocked<Pick<MetricsService, "recordSweep">>;
+  let killSwitch: jest.Mocked<Pick<KillSwitchService, "evaluateTarget">>;
   let sweeper: IntentsSweeperService;
 
   beforeEach(async () => {
@@ -65,6 +85,10 @@ describe("IntentsSweeperService", () => {
       }),
     } as unknown as jest.Mocked<SolverRegistryService>;
     metricsService = { recordSweep: jest.fn() } as unknown as jest.Mocked<Pick<MetricsService, "recordSweep">>;
+    // Default: no pause active, so existing sweeper expectations are unchanged.
+    killSwitch = {
+      evaluateTarget: jest.fn().mockReturnValue({ paused: false, matched: null, matchedChain: [] }),
+    } as unknown as jest.Mocked<Pick<KillSwitchService, "evaluateTarget">>;
 
     sweeper = new IntentsSweeperService(
       intentsService,
@@ -72,6 +96,8 @@ describe("IntentsSweeperService", () => {
       solversService,
       solverRegistryService,
       metricsService as unknown as MetricsService,
+      killSwitch as unknown as KillSwitchService,
+      noopLeaderElection(),
     );
   });
 
@@ -85,7 +111,7 @@ describe("IntentsSweeperService", () => {
       minDstAmount: "990000",
       deadline: deadline + 10_000, // create as open with a far-future deadline first
     });
-    await intentsService.update(intent.intentId, { state: "accepted", solver, deadline }, intent.version);
+    await intentsService.update(intent.intentId, { state: "accepted", solver, deadline }, (await intentsService.get(intent.intentId))!.version);
     return intent.intentId;
   }
 
@@ -172,7 +198,7 @@ describe("IntentsSweeperService", () => {
       minDstAmount: "990000",
       deadline: past + 10_000,
     });
-    await intentsService.update(intent.intentId, { state: "accepted", deadline: past }, intent.version);
+    await intentsService.update(intent.intentId, { state: "accepted", deadline: past }, (await intentsService.get(intent.intentId))!.version);
 
     await expect(sweeper.sweep()).resolves.not.toThrow();
     expect((await intentsService.get(intent.intentId))?.state).toBe("slashed");
@@ -218,6 +244,112 @@ describe("IntentsSweeperService", () => {
     expect(expiredCount).toBe(2);
   });
 
+  // ── Issue #477: a pause must not punish solvers ─────────────────────────────
+
+  describe("fill pause (issue #477)", () => {
+    it("suppresses slashing and extends the deadline while fills are paused", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past, ALPHA_ADDR);
+      killSwitch.evaluateTarget.mockReturnValue({
+        paused: true,
+        matched: {
+          scope: "chain",
+          chain: "ethereum",
+          token: null,
+          operation: null,
+          active: true,
+          reasonCode: "CHAIN_DEGRADED",
+          reason: "flap",
+          activatedBy: "alice",
+          updatedAt: 1,
+        },
+        matchedChain: [],
+      });
+
+      const result = await sweeper.sweep();
+
+      // Not slashed — the pause, not the solver, caused the missed fill.
+      expect(result.slashedCount).toBe(0);
+      expect(result.extendedDeadlines).toBe(1);
+      expect(solverRegistryService.slashSolver).not.toHaveBeenCalled();
+
+      const updated = await intentsService.get(intentId);
+      expect(updated?.state).toBe("accepted");
+      expect(updated!.deadline).toBeGreaterThan(past);
+    });
+
+    it("grants a full fill window from now, so a long pause is not penalised", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past, ALPHA_ADDR);
+      killSwitch.evaluateTarget.mockReturnValue({
+        paused: true,
+        matched: null,
+        matchedChain: [],
+      });
+
+      await sweeper.sweep();
+
+      const updated = await intentsService.get(intentId);
+      // ethereum's fill window is 1800 s, so the new deadline is ~30 min out.
+      expect(updated!.deadline).toBeGreaterThan(Math.floor(Date.now() / 1000) + 1000);
+    });
+
+    it("is idempotent — a second sweep does not keep pushing the deadline out", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past, ALPHA_ADDR);
+      killSwitch.evaluateTarget.mockReturnValue({
+        paused: true,
+        matched: null,
+        matchedChain: [],
+      });
+
+      await sweeper.sweep();
+      const afterFirst = (await intentsService.get(intentId))!.deadline;
+
+      // The intent is no longer past deadline, so the sweeper skips it entirely.
+      const second = await sweeper.sweep();
+      const afterSecond = (await intentsService.get(intentId))!.deadline;
+
+      expect(second.extendedDeadlines).toBe(0);
+      expect(afterSecond).toBe(afterFirst);
+    });
+
+    it("evaluates the pause per intent, so a token-scoped pause spares other tokens", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past, ALPHA_ADDR);
+
+      // Paused only for a different token.
+      killSwitch.evaluateTarget.mockReturnValue({
+        paused: false,
+        matched: null,
+        matchedChain: [],
+      });
+
+      const result = await sweeper.sweep();
+
+      expect(result.slashedCount).toBe(1);
+      expect((await intentsService.get(intentId))?.state).toBe("slashed");
+    });
+
+    it("slashing resumes normally once the pause is lifted", async () => {
+      const past = Math.floor(Date.now() / 1000) - 10;
+      const intentId = await makeAcceptedIntent(past, ALPHA_ADDR);
+
+      // Paused: window extended.
+      killSwitch.evaluateTarget.mockReturnValue({ paused: true, matched: null, matchedChain: [] });
+      await sweeper.sweep();
+      expect((await intentsService.get(intentId))?.state).toBe("accepted");
+
+      // Resumed, and the window has since elapsed again.
+      killSwitch.evaluateTarget.mockReturnValue({ paused: false, matched: null, matchedChain: [] });
+      await intentsService.update(intentId, { deadline: past }, (await intentsService.get(intentId))!.version);
+
+      const result = await sweeper.sweep();
+      expect(result.slashedCount).toBe(1);
+      expect((await intentsService.get(intentId))?.state).toBe("slashed");
+    });
+  });
+
   // ── #405: optimistic concurrency against late sweeper writes ────────────
 
   describe("optimistic concurrency (issue #405)", () => {
@@ -239,7 +371,8 @@ describe("IntentsSweeperService", () => {
       const intentId = await makeAcceptedIntent(past);
 
       const result = await sweepWithStaleSnapshot(intentId, () =>
-        intentsService.fillIfAccepted(intentId, ALPHA_ADDR, { fillAmount: "995000", filledAt: past, txHash: "h" }),
+        // `now` just before the lapsed deadline: the fill genuinely won the race.
+        intentsService.fillIfAccepted(intentId, ALPHA_ADDR, { fillAmount: "995000", filledAt: past - 5, txHash: "h" }, past - 5),
       );
 
       expect((await intentsService.get(intentId))?.state).toBe("filled");

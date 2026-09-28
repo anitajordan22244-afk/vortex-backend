@@ -2,11 +2,12 @@ import {
   Inject,
   Injectable,
   Logger,
-  OnModuleDestroy,
+  Optional,
   ServiceUnavailableException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { v4 as uuidv4 } from "uuid";
+import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { Intent, IntentAuditEntry, IntentState } from "./intents.types";
 import {
   INTENTS_REPOSITORY,
@@ -22,13 +23,39 @@ import {
   CHAIN_FILL_WINDOW_DEFAULTS,
   DEFAULT_FILL_WINDOW_SECONDS,
 } from "../config/configuration";
-import { SettlementContractClient } from "../soroban/contracts/settlement.client";
-import { isEvmSourceChain } from "../chains/evm/evm-chains";
-import { ContractVersionUnsupportedException } from "../soroban/contract-version.service";
+import { StellarTxService } from "../soroban/stellar-tx.service";
+import { ShadowService, type ShadowObservationRequest } from "../soroban/shadow.service";
+import { SHADOW_TRANSITIONS, type ShadowTransition } from "../soroban/shadow.types";
+import { MetricsService } from "../metrics/metrics.service";
 import { PrismaService } from "../prisma/prisma.service";
+import { ProtocolParamsService } from "../governance/params.service";
+import { FeatureFlagService } from "../flags/feature-flag.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { ContractVersionUnsupportedException } from "../soroban/contract-version.service";
+import { isEvmSourceChain } from "../chains/evm/evm-chains";
 
-const STORE_SIZE_LOG_INTERVAL_MS = 60_000;
 const TERMINAL_STATES: IntentState[] = ["filled", "cancelled", "expired", "slashed"];
+
+/**
+ * Sentinel `from_state` for the transition into "open".
+ *
+ * Not an {@link IntentState}: creation has no prior state, and inventing one
+ * would put a value in the `from_state` label that no lifecycle edge can
+ * produce. Bounded (one extra series), and it keeps the funnel's denominator
+ * honest.
+ */
+const NONE_STATE = "none";
+
+/**
+ * Runtime check that `transition` is one of the five the shadow monitor models.
+ *
+ * A mis-wired call site is logged and dropped rather than thrown on, so a shadow
+ * bug can never become a 500 on the intent path, and so an unknown label can
+ * never create a new Prometheus series.
+ */
+function isKnownShadowTransition(transition: ShadowTransition): boolean {
+  return (SHADOW_TRANSITIONS as readonly string[]).includes(transition);
+}
 
 /** How long a completed idempotency-key result stays replayable. */
 const IDEMPOTENCY_TTL_SECONDS = 86_400; // 24 hours
@@ -44,6 +71,11 @@ export type NewIntentData = Omit<
   Intent,
   "intentId" | "createdAt" | "state" | "version" | "srcVerified" | "srcVerification"
 >;
+
+/** The intent a mutation wrote, or null when it lost (state guard or version conflict). */
+function written(result: MutationResult): Intent | null {
+  return result && !isVersionConflict(result) ? result : null;
+}
 
 /**
  * Maximum number of simultaneously open (state = "open" | "accepted") intents
@@ -71,7 +103,7 @@ export const MAX_OPEN_INTENTS_PER_USER = 50;
  * (in-memory ↔ Prisma) without touching this service or anything above it.
  */
 @Injectable()
-export class IntentsService implements OnModuleDestroy {
+export class IntentsService {
   private readonly logger = new Logger(IntentsService.name);
 
   /**
@@ -91,29 +123,48 @@ export class IntentsService implements OnModuleDestroy {
    */
   private readonly auditLog = new Map<string, IntentAuditEntry[]>();
 
-  private readonly sizeLogTimer: ReturnType<typeof setInterval>;
-
   constructor(
     @Inject(INTENTS_REPOSITORY)
     private readonly repo: IIntentsRepository,
     private readonly configService: ConfigService<AppConfig, true>,
-    private readonly settlement: SettlementContractClient,
+    private readonly stellarTxService: StellarTxService,
     private readonly prisma: PrismaService,
-  ) {
-    const sweepMs = Number(this.configService.get("intentRetentionSweepMs", { infer: true }) ?? STORE_SIZE_LOG_INTERVAL_MS);
-    this.sizeLogTimer = setInterval(() => this.logStoreSize(), sweepMs || STORE_SIZE_LOG_INTERVAL_MS);
-    // Allow the process to exit even if the timer is still active.
-    this.sizeLogTimer.unref?.();
-  }
-
-  onModuleDestroy() {
-    clearInterval(this.sizeLogTimer);
-  }
+    /**
+     * Shadow-mode divergence monitor (issue #401).
+     *
+     * Injected `@Optional()` on purpose: the monitor is observability, not a
+     * correctness dependency, and the intent path must keep working — including
+     * in the unit-test harnesses that construct this service directly — when
+     * the soroban module is not in the graph.
+     */
+    @Optional() private readonly shadowService?: ShadowService,
+    /**
+     * SLO counters for the intent funnel (issue #481).
+     *
+     * `@Optional()` for the same reason as the shadow monitor: the dashboards
+     * are observability, and a unit harness that constructs this service
+     * directly must not have to provide a metrics registry. `MetricsModule` is
+     * `@Global()` and registered in `AppModule`, so in the running application
+     * this is always present.
+     */
+    @Optional() private readonly metricsService?: MetricsService,
+    private readonly protocolParamsService: ProtocolParamsService,
+    @Optional() private readonly flags?: FeatureFlagService,
+    /**
+     * Version-gated settlement client (issue #402). Always present in the
+     * running app (SorobanModule); `@Optional()` only so hand-built unit
+     * harnesses keep working — they fall back to the ungated legacy encoding.
+     */
+    @Optional() private readonly settlement?: SettlementContractClient,
+  ) {}
 
   /**
    * Logs the store size and evicts stale terminal intents from the in-memory
    * adapter when it is the active backend. This keeps the memory footprint
    * bounded without affecting on-chain or durable storage paths.
+   *
+   * Runs as the `intents.store-size` background job (see
+   * intents-maintenance.jobs.ts, issue #494) rather than a local timer.
    */
   async logStoreSize(): Promise<void> {
     const evicted = await this.evictTerminalIntents();
@@ -160,7 +211,13 @@ export class IntentsService implements OnModuleDestroy {
   async create(data: NewIntentData, idempotencyKey?: string): Promise<Intent> {
     if (!idempotencyKey) {
       const intent = await this.buildNewIntent(data);
-      return this.repo.save(intent);
+      await this.repo.save(intent);
+      // Creation is the entry edge of the funnel: the `vortex:intent:*` recording
+      // rules count transitions *into* each state, so without this the intent
+      // dashboard would start every conversion ratio from zero. `from_state` is
+      // the sentinel "none" — an intent that does not exist yet has no state.
+      this.countTransition(NONE_STATE, "open");
+      return intent;
     }
 
     // Race-safe claim: no `await` between this `get` and the `set` below, so
@@ -187,7 +244,9 @@ export class IntentsService implements OnModuleDestroy {
 
     const intent = await this.buildNewIntent(data);
     const result = await this.repo.createIdempotent(intent, idempotencyKey, minCreatedAt);
-    if (!result.created) {
+    if (result.created) {
+      this.countTransition(NONE_STATE, "open");
+    } else {
       // Another replica won the INSERT race between our lookup and insert.
       this.logger.warn(
         `[idempotency] key collision resolved to intent ${result.intent.intentId}; ` +
@@ -204,18 +263,32 @@ export class IntentsService implements OnModuleDestroy {
   private async buildNewIntent(data: NewIntentData): Promise<Intent> {
     const now = Math.floor(Date.now() / 1000);
 
+    // Snapshot governance-controlled parameters at creation time so in-flight
+    // intents are evaluated against the rules that were active when the user
+    // submitted (issue #500).
+    const paramsSnapshot = this.protocolParamsService.snapshotForChain(data.srcChain);
+    const defaultDeadline = data.deadline ?? now + paramsSnapshot.deadlineSeconds;
+
     const intent: Intent = {
       ...data,
       intentId: uuidv4(),
       state: "open",
       createdAt: now,
-      deadline:
-        data.deadline ?? now + (CHAIN_DEADLINE_DEFAULTS[data.srcChain] ?? DEFAULT_DEADLINE_SECONDS),
+      deadline: defaultDeadline,
+      paramsVersion: paramsSnapshot.version,
       version: 0,
       ...this.initialSrcVerification(data.srcChain, now),
     };
 
-    if (this.configService.get("onchainIntentsEnabled", { infer: true })) {
+    // ONCHAIN_INTENTS_ENABLED is the default; the `onchain-intents-enabled`
+    // runtime flag (issue #495) can roll it out per chain / percentage.
+    const onchain = this.flags
+      ? await this.flags.getBooleanValue("onchain-intents-enabled", {
+          targetingKey: intent.intentId,
+          chain: intent.srcChain,
+        })
+      : this.configService.get("onchainIntentsEnabled", { infer: true });
+    if (onchain) {
       await this.registerOnChain(intent);
     }
 
@@ -229,7 +302,10 @@ export class IntentsService implements OnModuleDestroy {
    * deposit. Stellar-source intents, and every intent while the flag is off,
    * are marked verified with status "skipped".
    */
-  private initialSrcVerification(srcChain: Intent["srcChain"], now: number): Pick<Intent, "srcVerified" | "srcVerification"> {
+  private initialSrcVerification(
+    srcChain: Intent["srcChain"],
+    now: number,
+  ): Pick<Intent, "srcVerified" | "srcVerification"> {
     const enabled = this.configService.get("evm", { infer: true })?.depositVerificationEnabled === true;
     if (enabled && isEvmSourceChain(srcChain)) {
       return { srcVerified: false, srcVerification: { status: "pending", checkedAt: now } };
@@ -246,19 +322,27 @@ export class IntentsService implements OnModuleDestroy {
 
   /**
    * Registers `intent` with the settlement contract. Only called when
-   * ONCHAIN_INTENTS_ENABLED is on; while that flag is off, create() never
-   * touches the chain (the rollout fallback). The settlement client gates the
-   * call on the deployed contract version (issue #402).
+   * ONCHAIN_INTENTS_ENABLED is on; while that flag is off, create() stays
+   * fully in-memory (the rollout fallback).
    */
   private async registerOnChain(intent: Intent): Promise<void> {
-    if (!this.settlement.contractId) {
+    const contractId = this.configService.get("stellar.settlementContractId", { infer: true });
+    if (!contractId) {
       throw new ServiceUnavailableException(
         "On-chain intent registration is enabled but SETTLEMENT_CONTRACT_ID is not configured",
       );
     }
 
     try {
-      const result = await this.settlement.createIntent(intent);
+      // The settlement client gates the write on the deployed contract
+      // version and encodes with that ABI's codec (issue #402).
+      const result = this.settlement
+        ? await this.settlement.createIntent(intent)
+        : await this.stellarTxService.invokeContract({
+            contractId,
+            method: "create_intent",
+            args: this.buildCreateIntentArgs(intent),
+          });
       this.logger.log(`Registered intent ${intent.intentId} on-chain (tx ${result.hash})`);
     } catch (err) {
       // Read-only mode: surface the version details rather than a generic error.
@@ -269,6 +353,123 @@ export class IntentsService implements OnModuleDestroy {
       throw new ServiceUnavailableException(
         "Failed to register intent with the settlement contract",
       );
+    }
+  }
+
+  private buildCreateIntentArgs(intent: Intent): xdr.ScVal[] {
+    return [
+      nativeToScVal(intent.intentId, { type: "string" }),
+      new Address(intent.user).toScVal(),
+      nativeToScVal(intent.srcChain, { type: "symbol" }),
+      nativeToScVal(intent.srcToken.address, { type: "string" }),
+      nativeToScVal(BigInt(intent.srcAmount), { type: "i128" }),
+      new Address(intent.dstToken.contract).toScVal(),
+      nativeToScVal(BigInt(intent.minDstAmount), { type: "i128" }),
+      nativeToScVal(intent.deadline, { type: "u64" }),
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shadow-mode divergence monitoring (issue #401)
+  // ---------------------------------------------------------------------------
+  //
+  // Every state transition the off-chain path commits is handed to
+  // ShadowService, which simulates the equivalent contract call on a background
+  // queue and records the (expected, simulated) pair. The call here is
+  // synchronous, allocation-light and never awaited — see the latency
+  // guarantee on ShadowService.observe.
+  //
+  // Both outcomes are reported, not just successes: a transition the off-chain
+  // path *refused* is the interesting negative case, because a contract that
+  // would have accepted it is a real divergence.
+
+  /**
+   * Report one off-chain transition to the shadow monitor.
+   *
+   * Callers MUST gate on {@link beginShadowObservation} first: that is where
+   * the disabled check and the sampling draw happen, so a sampled-out
+   * transition costs one `Math.random()` and no repository I/O, no XDR encoding
+   * and no timer work.
+   *
+   * The whole body is wrapped: the monitor is observability, so a bug in it can
+   * never surface as a failed intent transition.
+   */
+  private reportShadow(
+    transition: ShadowTransition,
+    intentId: string,
+    committed: boolean,
+    method: string,
+    args: xdr.ScVal[],
+  ): void {
+    try {
+      if (!this.shadowService) return;
+      if (!isKnownShadowTransition(transition)) {
+        // A mis-wired call site must be visible but must not throw into the
+        // request path, and must not create an unbounded Prometheus label.
+        this.logger.error(`[shadow] dropping observation with unknown transition "${transition}"`);
+        return;
+      }
+      const request: ShadowObservationRequest = { transition, intentId, committed, method, args };
+      this.shadowService.observe(request);
+    } catch (err) {
+      this.logger.error(`[shadow] reportShadow failed, discarding: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Ask the shadow monitor whether it wants to observe the transition that is
+   * about to happen, before any shadow-only work is done.
+   *
+   * Returns false when the monitor is absent, disabled, or has sampled this
+   * transition out. Sampling happens here rather than inside `observe()` so
+   * the extra repository read and XDR encoding the cancel/expire/slash hooks
+   * need are only paid for transitions that will actually be simulated.
+   */
+  private beginShadowObservation(): boolean {
+    try {
+      return this.shadowService?.shouldObserve() === true;
+    } catch (err) {
+      this.logger.error(`[shadow] shouldObserve failed: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Build the contract arguments for a transition, tolerating a record that
+   * cannot be encoded.
+   *
+   * A malformed intent (a non-integer amount, an unparseable address) must not
+   * be able to break the shadow path — the whole point of the monitor is to
+   * gather evidence, and an encoding failure is evidence in itself. It is
+   * therefore reported as an "empty" argument list, which simulates against the
+   * contract's arity check and surfaces as an `outcome_mismatch`.
+   */
+  private safeArgs(build: () => xdr.ScVal[]): xdr.ScVal[] {
+    try {
+      return build();
+    } catch (err) {
+      this.logger.warn(
+        `[shadow] could not encode contract args for simulation: ${(err as Error).message}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Count one committed lifecycle transition (issue #481).
+   *
+   * `vortex_intent_state_transitions_total{from_state,to_state}` is the only
+   * input to the `vortex:intent:*` recording rules, i.e. to the intent-funnel
+   * dashboard and to the `VortexIntentsNotTerminating` /
+   * `VortexSolverFillRateLow` alerts. It is counted here, once, immediately
+   * after the conditional write won — the same place the state actually moves,
+   * so a lost race is never counted.
+   */
+  private countTransition(from: string, to: string): void {
+    try {
+      this.metricsService?.incIntentStateTransition(from, to);
+    } catch (err) {
+      this.logger.error(`[metrics] could not record transition ${from}->${to}: ${(err as Error).message}`);
     }
   }
 
@@ -313,11 +514,25 @@ export class IntentsService implements OnModuleDestroy {
   }
 
   /**
-   * Apply `patch` only if the intent is still at `expectedVersion`
-   * (issue #405). Returns a VersionConflict otherwise — callers decide
-   * whether to retry or surface a 409/412.
+   * Patch an intent without going through a lifecycle edge.
+   *
+   * Production callers only patch non-state fields (`quotedDstAmount`), which is
+   * why this stays a plain repository call. A `state` in the patch is an
+   * unconditional write that bypasses the guarded `*If*` methods, and therefore
+   * also bypasses the funnel counters, the audit trail and the shadow monitor —
+   * it is used by test setup only. It is logged so that a future production
+   * caller is caught in review rather than silently skewing the dashboards.
+   *
+   * Applies only if the intent is still at `expectedVersion` (issue #405);
+   * otherwise returns a VersionConflict for the caller to retry or surface.
    */
   async update(id: string, patch: IntentPatch, expectedVersion: number): Promise<MutationResult> {
+    if (patch.state !== undefined) {
+      this.logger.warn(
+        `[state-machine] update(${id}) carries a state patch ("${patch.state}"); ` +
+          `this bypasses the guarded transitions and their observers`,
+      );
+    }
     return this.repo.update(id, patch, expectedVersion);
   }
 
@@ -348,35 +563,103 @@ export class IntentsService implements OnModuleDestroy {
   }
 
   /**
-   * Atomically accept an intent only if it is currently "open" (and, when
-   * given, still at `expectedVersion`).
+   * Atomically accept an intent only if it is currently "open" with a future
+   * deadline (issue #473). Delegates to the repository so both in-memory and
+   * Prisma adapters apply the conditional write atomically.
    *
-   * The new deadline is set to now + CHAIN_FILL_WINDOW_DEFAULTS[srcChain]
-   * so solvers on slower-settling chains get a proportionally longer window
-   * and are not unfairly slashed for a deadline that was never realistic.
-   * Returns null when the intent is not found or is not in the "open" state.
+   * The new deadline is set to now + fill window from governance params (or
+   * CHAIN_FILL_WINDOW_DEFAULTS[srcChain] as fallback) so solvers on
+   * slower-settling chains get a proportionally longer window and are not
+   * unfairly slashed for a deadline that was never realistic.
+   * Returns null when the intent is not found, not open, or past deadline,
+   * and a VersionConflict when `expectedVersion` (If-Match) is stale.
    */
-  async acceptIfOpen(id: string, solver: string, expectedVersion?: number): Promise<MutationResult> {
+  async acceptIfOpen(
+    id: string,
+    solver: string,
+    now?: number,
+    expectedVersion?: number,
+  ): Promise<MutationResult> {
     const intent = await this.repo.findById(id);
     if (!intent) return null;
-    const now = Math.floor(Date.now() / 1000);
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
     const fillWindow =
       CHAIN_FILL_WINDOW_DEFAULTS[intent.srcChain] ?? DEFAULT_FILL_WINDOW_SECONDS;
-    return this.repo.acceptIfOpen(id, solver, now + fillWindow, expectedVersion);
+    const result = await this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec, expectedVersion);
+    const updated = written(result);
+    if (updated !== null) this.countTransition("open", "accepted");
+    if (this.beginShadowObservation()) {
+      this.observeAccept(updated ?? intent, solver, updated !== null);
+    }
+    return result;
+  }
+
+  /** Shadow hook for `accept` — reported whether or not the conditional write won. */
+  private observeAccept(intent: Intent, solver: string, committed: boolean): void {
+    this.reportShadow(
+      "accept",
+      intent.intentId,
+      committed,
+      "accept_intent",
+      this.safeArgs(() => [
+        nativeToScVal(intent.intentId, { type: "string" }),
+        new Address(solver).toScVal(),
+        nativeToScVal(intent.deadline, { type: "u64" }),
+      ]),
+    );
+    const snapshot = this.protocolParamsService.snapshotForChain(intent.srcChain);
+    const fillWindow = snapshot.fillWindowSeconds;
+    return this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
   }
 
   /**
-   * Atomically fill an intent only if it is currently "accepted" by the given solver.
-   * Returns null when the intent is not found, not accepted, or assigned to a
-   * different solver.
+   * Atomically fill an intent only if it is currently "accepted" by the given
+   * solver with a future deadline (issue #473).
+   * Returns null when the intent is not found, not accepted, assigned to a
+   * different solver, or past the fill window (sweeper wins).
    */
   async fillIfAccepted(
     id: string,
     solver: string,
     patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    now?: number,
     expectedVersion?: number,
   ): Promise<MutationResult> {
-    return this.repo.fillIfAccepted(id, solver, patch, expectedVersion);
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
+    const result = await this.repo.fillIfAccepted(id, solver, patch, nowSec, expectedVersion);
+    const updated = written(result);
+    if (updated !== null) this.countTransition("accepted", "filled");
+    if (this.beginShadowObservation()) {
+      // Report from `patch` rather than re-reading: on a lost race the stored
+      // record belongs to whoever won, so its fill amount is not the amount
+      // this call was asked to settle. The submitted values are the ones the
+      // contract would have been handed if the off-chain guard had not
+      // pre-empted it.
+      this.observeFill(id, solver, patch.fillAmount, patch.txHash, updated !== null);
+    }
+    return result;
+  }
+
+  /** Shadow hook for `fill` — reported whether or not the conditional write won. */
+  private observeFill(
+    intentId: string,
+    solver: string,
+    fillAmount: string | undefined,
+    txHash: string | undefined,
+    committed: boolean,
+  ): void {
+    this.reportShadow(
+      "fill",
+      intentId,
+      committed,
+      "fill_intent",
+      this.safeArgs(() => [
+        nativeToScVal(intentId, { type: "string" }),
+        new Address(solver).toScVal(),
+        nativeToScVal(BigInt(fillAmount ?? "0"), { type: "i128" }),
+        nativeToScVal(txHash ?? "", { type: "string" }),
+      ]),
+    );
   }
 
   /**
@@ -385,7 +668,25 @@ export class IntentsService implements OnModuleDestroy {
    * (e.g. a concurrent accept() or sweeper expiry already transitioned it).
    */
   async cancelIfOpen(id: string, expectedVersion?: number): Promise<MutationResult> {
-    return this.repo.cancelIfOpen(id, expectedVersion);
+    const result = await this.repo.cancelIfOpen(id, expectedVersion);
+    const updated = written(result);
+    if (updated !== null) this.countTransition("open", "cancelled");
+    if (this.beginShadowObservation()) {
+      const subject = updated ?? (await this.repo.findById(id));
+      if (subject) {
+        this.reportShadow(
+          "cancel",
+          subject.intentId,
+          updated !== null,
+          "cancel_intent",
+          this.safeArgs(() => [
+            nativeToScVal(subject.intentId, { type: "string" }),
+            new Address(subject.user).toScVal(),
+          ]),
+        );
+      }
+    }
+    return result;
   }
 
   /**
@@ -394,7 +695,25 @@ export class IntentsService implements OnModuleDestroy {
    * always wins the race.
    */
   async expireIfOpen(id: string, expectedVersion?: number): Promise<MutationResult> {
-    return this.repo.expireIfOpen(id, expectedVersion);
+    const result = await this.repo.expireIfOpen(id, expectedVersion);
+    const updated = written(result);
+    if (updated !== null) this.countTransition("open", "expired");
+    if (this.beginShadowObservation()) {
+      const subject = updated ?? (await this.repo.findById(id));
+      if (subject) {
+        this.reportShadow(
+          "expire",
+          subject.intentId,
+          updated !== null,
+          "expire_intent",
+          this.safeArgs(() => [
+            nativeToScVal(subject.intentId, { type: "string" }),
+            nativeToScVal(subject.deadline, { type: "u64" }),
+          ]),
+        );
+      }
+    }
+    return result;
   }
 
   /**
@@ -406,7 +725,44 @@ export class IntentsService implements OnModuleDestroy {
     patch: { slashedAt: number; slashReason: string },
     expectedVersion?: number,
   ): Promise<MutationResult> {
-    return this.repo.slashIfAccepted(id, patch, expectedVersion);
+    const result = await this.repo.slashIfAccepted(id, patch, expectedVersion);
+    const updated = written(result);
+    if (updated !== null) this.countTransition("accepted", "slashed");
+    if (this.beginShadowObservation()) {
+      const subject = updated ?? (await this.repo.findById(id));
+      // An "accepted" intent always carries a solver. A record without one is
+      // corrupt, so skip the simulation rather than encoding a null address —
+      // the sweep loop already logs that case loudly.
+      if (subject?.solver) {
+        this.reportShadow(
+          "slash",
+          subject.intentId,
+          updated !== null,
+          "slash_intent",
+          this.safeArgs(() => [
+            nativeToScVal(subject.intentId, { type: "string" }),
+            new Address(subject.solver).toScVal(),
+            nativeToScVal(patch.slashReason, { type: "string" }),
+            nativeToScVal(patch.slashedAt, { type: "u64" }),
+          ]),
+        );
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Issue #477 — extend an accepted intent's fill window, used by the sweeper
+   * while an emergency pause blocks fills so the solver is not slashed for a
+   * pause it did not cause. Returns null when the intent is no longer accepted
+   * or already has a later deadline.
+   */
+  async extendDeadlineIfAccepted(
+    id: string,
+    newDeadline: number,
+    expectedVersion?: number,
+  ): Promise<MutationResult> {
+    return this.repo.extendDeadlineIfAccepted(id, newDeadline, expectedVersion);
   }
 
   // ---------------------------------------------------------------------------

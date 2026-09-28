@@ -160,14 +160,15 @@ export function runIntentsRepositoryContract(
           from: { state: "open" },
           wrongFrom: { state: "cancelled" },
           to: "accepted",
-          run: (r, id, v) => r.acceptIfOpen(id, "GSOLVER", now + 600, v),
+          run: (r, id, v) => r.acceptIfOpen(id, "GSOLVER", now + 600, undefined, v),
         },
         {
           name: "fillIfAccepted",
           from: { state: "accepted", solver: "GSOLVER" },
           wrongFrom: { state: "accepted", solver: "GOTHER" },
           to: "filled",
-          run: (r, id, v) => r.fillIfAccepted(id, "GSOLVER", { fillAmount: "995000", filledAt: now, txHash: "h" }, v),
+          run: (r, id, v) =>
+            r.fillIfAccepted(id, "GSOLVER", { fillAmount: "995000", filledAt: now, txHash: "h" }, undefined, v),
         },
         {
           name: "cancelIfOpen",
@@ -182,6 +183,13 @@ export function runIntentsRepositoryContract(
           wrongFrom: { state: "filled" },
           to: "expired",
           run: (r, id, v) => r.expireIfOpen(id, v),
+        },
+        {
+          name: "extendDeadlineIfAccepted",
+          from: { state: "accepted", solver: "GSOLVER" },
+          wrongFrom: { state: "open" },
+          to: "accepted",
+          run: (r, id, v) => r.extendDeadlineIfAccepted(id, now + 99_999, v),
         },
         {
           name: "slashIfAccepted",
@@ -225,6 +233,25 @@ export function runIntentsRepositoryContract(
           });
         });
       }
+
+      it("refuses to accept or fill once the deadline has passed (issue #473)", async () => {
+        const lapsedOpen = await seeded({ deadline: now - 1 });
+        expect(await repo.acceptIfOpen(lapsedOpen.intentId, "GSOLVER", now + 600)).toBeNull();
+
+        const lapsedAccepted = await seeded({ state: "accepted", solver: "GSOLVER", deadline: now - 1 });
+        expect(await repo.fillIfAccepted(lapsedAccepted.intentId, "GSOLVER", { fillAmount: "1" })).toBeNull();
+
+        // An explicit `now` before the deadline still succeeds.
+        const pinned = await seeded({ deadline: now + 10 });
+        expect(await repo.acceptIfOpen(pinned.intentId, "GSOLVER", now + 600, now)).toMatchObject({ state: "accepted" });
+      });
+
+      it("extendDeadlineIfAccepted never shortens a window", async () => {
+        const intent = await seeded({ state: "accepted", solver: "GSOLVER", deadline: now + 500 });
+        expect(await repo.extendDeadlineIfAccepted(intent.intentId, now + 100)).toBeNull();
+        expect(await repo.extendDeadlineIfAccepted(intent.intentId, now + 500)).toBeNull();
+        expect(await repo.extendDeadlineIfAccepted(intent.intentId, now + 900)).toMatchObject({ deadline: now + 900, version: 1 });
+      });
 
       it("records slash metadata", async () => {
         const intent = await seeded({ state: "accepted", solver: "GSOLVER" });

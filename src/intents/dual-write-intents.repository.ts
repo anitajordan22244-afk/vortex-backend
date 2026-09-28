@@ -128,17 +128,31 @@ export class DualWriteIntentsRepository implements IIntentsRepository {
     return this.primary.delete(id);
   }
 
-  acceptIfOpen(id: string, solver: string, newDeadline: number, expectedVersion?: number): Promise<MutationResult> {
-    return this.mirrored("acceptIfOpen", this.primary.acceptIfOpen(id, solver, newDeadline, expectedVersion));
+  acceptIfOpen(
+    id: string,
+    solver: string,
+    newDeadline: number,
+    now?: number,
+    expectedVersion?: number,
+  ): Promise<MutationResult> {
+    return this.mirrored("acceptIfOpen", this.primary.acceptIfOpen(id, solver, newDeadline, now, expectedVersion));
   }
 
   fillIfAccepted(
     id: string,
     solver: string,
     patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    now?: number,
     expectedVersion?: number,
   ): Promise<MutationResult> {
-    return this.mirrored("fillIfAccepted", this.primary.fillIfAccepted(id, solver, patch, expectedVersion));
+    return this.mirrored("fillIfAccepted", this.primary.fillIfAccepted(id, solver, patch, now, expectedVersion));
+  }
+
+  extendDeadlineIfAccepted(id: string, newDeadline: number, expectedVersion?: number): Promise<MutationResult> {
+    return this.mirrored(
+      "extendDeadlineIfAccepted",
+      this.primary.extendDeadlineIfAccepted(id, newDeadline, expectedVersion),
+    );
   }
 
   cancelIfOpen(id: string, expectedVersion?: number): Promise<MutationResult> {

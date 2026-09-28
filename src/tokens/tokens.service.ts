@@ -1,7 +1,8 @@
 import { BadRequestException, Inject, Injectable } from "@nestjs/common";
 import { SUPPORTED_TOKENS, StellarToken } from "./tokens.data";
+import { SUPPORTED_TOKENS, STELLAR_TOKENS, StellarToken } from "./tokens.data";
 import { SupportedChain } from "../intents/intents.types";
-import { ITokensRepository, TOKENS_REPOSITORY } from "./tokens.repository";
+import { ITokensRepository, TOKENS_REPOSITORY, TokenRecord } from "./tokens.repository";
 
 /**
  * A resolved source-chain (EVM or Stellar source) token — always has a
@@ -30,6 +31,21 @@ export interface ResolvedDstToken {
 }
 
 export type ResolvedToken = ResolvedSrcToken | ResolvedDstToken;
+
+export interface ApiToken {
+  address: string;
+  contract: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  priceUSD: number;
+}
+
+export interface TokensByChainResponse {
+  tokens: ApiToken[] | Record<string, ApiToken[]>;
+  chain?: string;
+  stellarTokens?: ApiToken[];
+}
 
 @Injectable()
 export class TokensService {
@@ -90,7 +106,10 @@ export class TokensService {
    * Use this on the write path (intent creation) where an unrecognised token
    * must be rejected outright rather than silently stored with no priceUSD.
    */
-  async resolveSrcTokenOrThrow(chain: SupportedChain, address: string): Promise<ResolvedSrcToken> {
+  async resolveSrcTokenOrThrow(
+    chain: SupportedChain,
+    address: string,
+  ): Promise<ResolvedSrcToken> {
     const token = await this.resolveSrcToken(chain, address);
     if (!token) {
       throw new BadRequestException(
@@ -115,32 +134,120 @@ export class TokensService {
     return token;
   }
 
-  async getByChain(chain?: string) {
-    const records = await this.repo.findAll();
-    const stellarTokens = records.filter((t) => t.chain === "stellar");
-    const chainRecords = records.filter((t) => t.chain !== "stellar");
+  private toApiToken(record: TokenRecord): ApiToken {
+  /**
+   * Normalise a stored {@link TokenRecord} into the public token shape.
+   *
+   * Both `address` and `contract` are emitted with the same value so clients
+   * can read either field regardless of whether the token is EVM- or
+   * Stellar-native — the registry stores every token under `address`, but the
+   * Stellar side of the API has always used `contract`.
+   */
+  private toApiToken(record: TokenRecord) {
+    return {
+      address: record.address,
+      contract: record.address,
+      symbol: record.symbol,
+      name: record.name,
+      decimals: record.decimals,
+      priceUSD: record.priceUsd ?? 0,
+    };
+  }
+
+  getByChain(chain?: string): TokensByChainResponse {
+    const chainRecords =
+      chain !== undefined && (chain === "stellar" || chain in SUPPORTED_TOKENS)
+        ? this.repo.findByChain(chain)
+        : this.repo.findAll();
+    const stellarTokens = chainRecords.filter((record) => record.chain === "stellar");
+
     if (chain === "stellar") {
-      return { tokens: stellarTokens.map((t) => ({ ...t, contract: t.address })), chain: "stellar" };
+      return { tokens: stellarTokens.map((record) => this.toApiToken(record)), chain: "stellar" };
     }
-    if (chain && chain in SUPPORTED_TOKENS) {
+    if (chain !== undefined && chain in SUPPORTED_TOKENS) {
       return {
-        tokens: chainRecords.filter((t) => t.chain === chain).map((t) => ({ ...t, contract: t.address })),
+        tokens: chainRecords
+          .filter((record) => record.chain === chain)
+          .map((record) => this.toApiToken(record)),
         chain,
+  /**
+   * Return the supported token registry, optionally narrowed to one chain.
+   *
+   * - `chain="stellar"` → `{ tokens: StellarToken[], chain: "stellar" }`
+   * - `chain=<known>`   → `{ tokens: Token[], chain }`
+   * - omitted / unknown → `{ tokens: Record<chain, Token[]>, stellarTokens: Token[] }`
+   *
+   * An unrecognised chain deliberately falls back to the full registry rather
+   * than erroring: this endpoint feeds discovery UIs, and a client with a
+   * stale chain list should see everything, not a 4xx.
+   */
+  async getByChain(chain?: string) {
+    const requested = chain?.toLowerCase();
+
+    if (requested === "stellar") {
+      const records = await this.repo.findByChain("stellar");
+      return {
+        tokens: records.map((record) => this.toApiToken(record)),
+        chain: "stellar",
       };
     }
+
+    if (requested && requested in SUPPORTED_TOKENS) {
+      const records = await this.repo.findByChain(requested);
+      return {
+        tokens: records
+          .filter((record) => record.chain === requested)
+          .map((record) => this.toApiToken(record)),
+        chain: requested,
+      };
+    }
+
+    const all = await this.repo.findAll();
+
+    // Bucket by chain, pre-seeding a key for every chain the static registry
+    // declares so a chain with no rows still appears as an empty array rather
+    // than vanishing from the response shape.
+    const byChain: Record<string, ReturnType<TokensService["toApiToken"]>[]> = {};
+    for (const key of Object.keys(SUPPORTED_TOKENS)) {
+      byChain[key] = [];
+    }
+    for (const record of all) {
+      if (!byChain[record.chain]) byChain[record.chain] = [];
+      byChain[record.chain].push(this.toApiToken(record));
+    }
+
     return {
       tokens: Object.fromEntries(
-        Object.keys(SUPPORTED_TOKENS).map((key) => [
+        Object.entries(SUPPORTED_TOKENS).map(([key, _]) => [
           key,
-          chainRecords.filter((t) => t.chain === key).map((t) => ({ ...t, contract: t.address })),
+          chainRecords
+            .filter((record) => record.chain === key)
+            .map((record) => this.toApiToken(record)),
         ]),
       ),
-      stellarTokens: stellarTokens.map((t) => ({ ...t, contract: t.address })),
+      stellarTokens: stellarTokens.map((record) => this.toApiToken(record)),
+    };
+  }
+
+  getStellarTokens(): { tokens: StellarToken[] } {
+    const records = this.repo.findByChain("stellar");
+      tokens: byChain,
+      stellarTokens: all
+        .filter((record) => record.chain === "stellar")
+        .map((record) => this.toApiToken(record)),
     };
   }
 
   async getStellarTokens(): Promise<{ tokens: StellarToken[] }> {
-    const tokens = await this.repo.findByChain("stellar");
-    return { tokens: tokens.map((t) => ({ contract: t.address, symbol: t.symbol, name: t.name, decimals: t.decimals, priceUSD: t.priceUsd ?? 0 })) };
+    const records = await this.repo.findByChain("stellar");
+    return {
+      tokens: records.map((record) => ({
+        contract: record.address,
+        symbol: record.symbol,
+        name: record.name,
+        decimals: record.decimals,
+        priceUSD: record.priceUsd ?? 0,
+      })),
+    };
   }
 }

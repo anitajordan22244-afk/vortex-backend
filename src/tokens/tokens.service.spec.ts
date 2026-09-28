@@ -1,8 +1,13 @@
 import { BadRequestException } from "@nestjs/common";
+import { InMemoryTokensRepository } from "./in-memory-tokens.repository";
 import { TokensService } from "./tokens.service";
 import { SUPPORTED_TOKENS, STELLAR_TOKENS } from "./tokens.data";
-import { InMemoryTokensRepository } from "./in-memory-tokens.repository";
 
+/**
+ * TokensService is backed by ITokensRepository so the registry can move to
+ * Postgres without touching callers. The in-memory adapter is injected here
+ * and the async read methods are awaited, matching the production shape.
+ */
 describe("TokensService", () => {
   let service: TokensService;
 
@@ -12,9 +17,10 @@ describe("TokensService", () => {
 
   it("getByChain with no chain returns the full registry plus Stellar tokens", async () => {
     const result = await service.getByChain();
-    // Both token lists present
+    // Both token maps present
     expect(result).toHaveProperty("tokens");
     expect(result).toHaveProperty("stellarTokens");
+    expect(result.tokens).toHaveProperty("ethereum");
   });
 
   it("getByChain('stellar') returns only Stellar tokens", async () => {
@@ -32,6 +38,7 @@ describe("TokensService", () => {
   it("getByChain with an unknown chain falls back to the full registry", async () => {
     const result = await service.getByChain("not-a-real-chain");
     expect(result).toHaveProperty("tokens");
+    expect(result.tokens).toHaveProperty("ethereum");
   });
 
   it("getStellarTokens returns the Stellar token list", async () => {
@@ -93,7 +100,7 @@ describe("TokensService", () => {
 
     it("returns undefined for an unknown chain", async () => {
       // "optimism" is in the SUPPORTED_TOKENS registry but let's verify a truly unknown chain
-      expect(await service.resolveSrcToken("avalanche" as any, "0xunknown")).toBeUndefined();
+      expect(await service.resolveSrcToken("avalanche" as never, "0xunknown")).toBeUndefined();
     });
   });
 
@@ -137,11 +144,18 @@ describe("TokensService", () => {
     });
 
     it("throws BadRequestException for an unknown address on a known chain", async () => {
-      await expect(service.resolveSrcTokenOrThrow("ethereum", "0x1111111111111111111111111111111111111111")).rejects.toThrow(BadRequestException);
+      await expect(
+        service.resolveSrcTokenOrThrow(
+          "ethereum",
+          "0x1111111111111111111111111111111111111111",
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
     });
 
     it("throws BadRequestException for an unknown Stellar source contract", async () => {
-      await expect(service.resolveSrcTokenOrThrow("stellar", "CUNKNOWN")).rejects.toThrow(BadRequestException);
+      await expect(service.resolveSrcTokenOrThrow("stellar", "CUNKNOWN")).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
     });
   });
 
@@ -153,11 +167,15 @@ describe("TokensService", () => {
     });
 
     it("throws BadRequestException for an unknown contract", async () => {
-      await expect(service.resolveDstTokenOrThrow("CNOTEXIST")).rejects.toThrow(BadRequestException);
+      await expect(service.resolveDstTokenOrThrow("CNOTEXIST")).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
     });
 
     it("throws BadRequestException for an empty contract", async () => {
-      await expect(service.resolveDstTokenOrThrow("")).rejects.toThrow(BadRequestException);
+      await expect(service.resolveDstTokenOrThrow("")).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
     });
   });
 });

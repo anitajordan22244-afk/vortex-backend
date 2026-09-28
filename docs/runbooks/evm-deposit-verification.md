@@ -120,5 +120,4 @@ A chain missing from either map keeps its intents `pending` with detail
     src_verification = jsonb_build_object('status','skipped','checkedAt',EXTRACT(EPOCH FROM NOW())::bigint,'detail','verification disabled')
   WHERE state = 'open' AND NOT src_verified;
   ```
-- Schema rollback SQL is in the header of
-  `prisma/migrations/20260927000002_intent_src_verification/migration.sql`.
+- Schema rollback: `prisma/migrations/20260929000002_intent_src_verification/down.sql`.

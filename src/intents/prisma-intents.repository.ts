@@ -191,12 +191,14 @@ export class PrismaIntentsRepository implements IIntentsRepository {
     id: string,
     solver: string,
     newDeadline: number,
+    now?: number,
     expectedVersion?: number,
   ): Promise<MutationResult> {
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
     return this.conditionalUpdate(
       id,
       [Prisma.sql`state = 'accepted'`, Prisma.sql`solver = ${solver}`, Prisma.sql`deadline = ${newDeadline}`],
-      Prisma.sql`state = 'open'`,
+      Prisma.sql`state = 'open' AND deadline > ${nowSec}`,
       expectedVersion,
     );
   }
@@ -205,12 +207,23 @@ export class PrismaIntentsRepository implements IIntentsRepository {
     id: string,
     solver: string,
     patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    now?: number,
     expectedVersion?: number,
   ): Promise<MutationResult> {
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
     return this.conditionalUpdate(
       id,
       [Prisma.sql`state = 'filled'`, ...this.patchAssignments(patch)],
-      Prisma.sql`state = 'accepted' AND solver = ${solver}`,
+      Prisma.sql`state = 'accepted' AND solver = ${solver} AND deadline > ${nowSec}`,
+      expectedVersion,
+    );
+  }
+
+  async extendDeadlineIfAccepted(id: string, newDeadline: number, expectedVersion?: number): Promise<MutationResult> {
+    return this.conditionalUpdate(
+      id,
+      [Prisma.sql`deadline = ${newDeadline}`],
+      Prisma.sql`state = 'accepted' AND deadline < ${newDeadline}`,
       expectedVersion,
     );
   }

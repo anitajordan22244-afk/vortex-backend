@@ -1,12 +1,13 @@
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
 import { Transform, Type } from "class-transformer";
-import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { ApiPropertyOptional } from "@nestjs/swagger";
 import {
   INTENT_STATES,
   IntentState,
   SUPPORTED_CHAINS,
   SupportedChain,
 } from "../intents.types";
+import { LIST_MAX_LIMIT } from "../../config/limits.config";
 
 export class ListIntentsDto {
   @ApiPropertyOptional({
@@ -30,12 +31,17 @@ export class ListIntentsDto {
   @IsIn(SUPPORTED_CHAINS)
   chain?: SupportedChain;
 
-  @ApiPropertyOptional({ minimum: 1, maximum: 100, default: 20, description: "Number of results per page" })
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: LIST_MAX_LIMIT,
+    default: 20,
+    description: `Number of results per page (max ${LIST_MAX_LIMIT})`,
+  })
   @IsOptional()
   @Type(() => Number) // query strings arrive as text
   @IsInt()
   @Min(1)
-  @Max(100)
+  @Max(LIST_MAX_LIMIT)
   limit?: number;
 
   @ApiPropertyOptional({ description: "Cursor for the next page of intents" })

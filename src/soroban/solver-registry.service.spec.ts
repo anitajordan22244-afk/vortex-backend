@@ -42,6 +42,32 @@ function makeConfigService(
     wsMaxConnections: 1000,
     wsBackplane: "memory",
     redisUrl: "redis://localhost:6379",
+    // Resource-exhaustion limits (issue #476) — test defaults
+    jsonMaxDepth: 10,
+    wsMaxFilterChains: 20,
+    wsMaxSubscriptions: 10,
+    dbQueryTimeoutMs: 5000,
+    dbBatchQueryTimeoutMs: 10000,
+    dbStatsQueryTimeoutMs: 15000,
+    // Emergency kill-switch (issue #477) — no operator token in unit tests, so
+    // the control plane stays disabled.
+    killswitch: {
+      operatorToken: "",
+      redisUrl: "",
+      pollMs: 2000,
+    governance: {
+      paramsContractId: "",
+      paramsPollIntervalMs: 30_000,
+    leaderElection: {
+      enabled: false,
+      heartbeatMs: 5000,
+    },
+    processRole: "all",
+    jobs: { driver: "memory", shutdownTimeoutMs: 25000 },
+    flags: { pubsub: "memory", refreshMs: 30000, overrides: "" },
+    adminApiKeys: "",
+    guardianContractId: "",
+    canaryAddresses: [],
   };
   return {
     get: (key: string) => {
@@ -136,7 +162,7 @@ describe("SolverRegistryService — contract version gating (#402)", () => {
     const versions = {
       assertWritable: jest.fn().mockRejectedValue(new ContractVersionUnsupportedException(state as never)),
     } as unknown as ContractVersionService;
-    const service = new SolverRegistryService(live(), undefined, versions);
+    const service = new SolverRegistryService(live(), undefined, undefined, undefined, versions);
     const getAccount = jest.spyOn((service as unknown as { server: { getAccount: () => unknown } }).server, "getAccount");
 
     const result = await service.slashSolver({ solverAddress: Keypair.random().publicKey(), intentId: "i-1", reason: "r" });
@@ -150,7 +176,9 @@ describe("SolverRegistryService — contract version gating (#402)", () => {
     const versions = { assertWritable: jest.fn() } as unknown as ContractVersionService;
     const service = new SolverRegistryService(
       makeConfigService({ solverRegistryContractId: "CTEST123", signingKey: "S" + "A".repeat(55) }, { onchainDryRun: true }),
-      undefined,
+      undefined, // signer
+      undefined, // kill switch
+      undefined, // feature flags
       versions,
     );
     await service.slashSolver({ solverAddress: "G", intentId: "i", reason: "r" });

@@ -31,7 +31,7 @@ only consulted when `INTENTS_STORE` is unset.
 
 1. `DATABASE_URL` points at the target Postgres.
 2. Migrations are applied: `npm run db:migrate:prod`. This PR adds
-   `20260927000000_intent_version_idempotency` (`version`, `idempotency_key`,
+   `20260929000000_intent_version_idempotency` (`version`, `idempotency_key`,
    `slashed_at`, `slash_reason`, and the previously missing `fee_amount`).
 3. Prometheus is scraping `GET /metrics`.
 
@@ -86,17 +86,8 @@ The verifier logs up to five samples per run:
 
 ### Schema rollback
 
-The migration only adds nullable or defaulted columns, so the app can run
-against the old code without rolling back the schema. If the columns must go:
-
-```sql
-DROP INDEX IF EXISTS "intents_idempotency_key_key";
-ALTER TABLE "intents"
-  DROP COLUMN IF EXISTS "idempotency_key",
-  DROP COLUMN IF EXISTS "version",
-  DROP COLUMN IF EXISTS "slash_reason",
-  DROP COLUMN IF EXISTS "slashed_at";
-```
-
+The migration only adds nullable or defaulted columns, so the previous release
+runs fine against the new schema without rolling it back. If the columns must
+go, apply `prisma/migrations/20260929000000_intent_version_idempotency/down.sql`
+as a change-managed operation (see `prisma/migrations/README.md`).
 `fee_amount` is left in place because `schema.prisma` has always declared it.
-Run this as a change-managed operation (see `prisma/migrations/README.md`).

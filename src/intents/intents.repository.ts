@@ -137,26 +137,52 @@ export interface IIntentsRepository {
   delete(id: string): MaybePromise<boolean>;
 
   /**
-   * Atomically transition an intent from `open` → `accepted`:
+   * Atomically transition an intent from `open` → `accepted` while its
+   * deadline is still in the future (issue #473):
    *   UPDATE intents SET state='accepted', solver=$2, deadline=$3, version=version+1
-   *   WHERE intent_id=$1 AND state='open' [AND version=$4] RETURNING *
-   * Returns `null` when the intent is not found or is not `open` (already taken).
+   *   WHERE intent_id=$1 AND state='open' AND deadline > $now [AND version=$v] RETURNING *
+   * Returns `null` when the intent is not found, already taken, or past its
+   * deadline (the sweeper wins that race). `now` defaults to the current time.
+   *
+   * Lock ordering (issue #473): callers holding a per-solver advisory lock
+   * must acquire it BEFORE invoking this method; this method itself only
+   * touches the single intent row so no lock inversion is possible.
    */
   acceptIfOpen(
     id: string,
     solver: string,
     newDeadline: number,
+    now?: number,
     expectedVersion?: number,
   ): MaybePromise<MutationResult>;
 
   /**
    * Atomically transition an intent from `accepted` → `filled` only if it is
-   * currently accepted by the specified solver.
+   * currently accepted by the specified solver AND the fill window has not
+   * elapsed (issue #473). The `minDstAmount` invariant is enforced by the
+   * controller before this write; the state + deadline predicates make the
+   * write itself race-free.
    */
   fillIfAccepted(
     id: string,
     solver: string,
     patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    now?: number,
+    expectedVersion?: number,
+  ): MaybePromise<MutationResult>;
+
+  /**
+   * Atomically push an accepted intent's deadline out to `newDeadline`, only
+   * while it is still `accepted` and its deadline is earlier (issue #477):
+   *   UPDATE intents SET deadline=$2, version=version+1
+   *   WHERE intent_id=$1 AND state='accepted' AND deadline < $2 [AND version=$v] RETURNING *
+   * While an emergency pause covers `fill`, the sweeper extends windows instead
+   * of slashing. The `deadline < $2` guard makes repeat calls no-ops and never
+   * shortens a window; a concurrent fill or slash wins via the state predicate.
+   */
+  extendDeadlineIfAccepted(
+    id: string,
+    newDeadline: number,
     expectedVersion?: number,
   ): MaybePromise<MutationResult>;
 
@@ -275,11 +301,18 @@ export class InMemoryIntentsRepository implements IIntentsRepository {
     return this.store.delete(id);
   }
 
-  acceptIfOpen(id: string, solver: string, newDeadline: number, expectedVersion?: number): MutationResult {
+  acceptIfOpen(
+    id: string,
+    solver: string,
+    newDeadline: number,
+    now?: number,
+    expectedVersion?: number,
+  ): MutationResult {
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
     return this.mutate(
       id,
       expectedVersion,
-      (i) => i.state === "open",
+      (i) => i.state === "open" && i.deadline > nowSec,
       (i) => ({ ...i, state: "accepted", solver, deadline: newDeadline }),
     );
   }
@@ -288,13 +321,24 @@ export class InMemoryIntentsRepository implements IIntentsRepository {
     id: string,
     solver: string,
     patch: Pick<Partial<Intent>, "filledAt" | "fillAmount" | "feeAmount" | "txHash">,
+    now?: number,
     expectedVersion?: number,
   ): MutationResult {
+    const nowSec = now ?? Math.floor(Date.now() / 1000);
     return this.mutate(
       id,
       expectedVersion,
-      (i) => i.state === "accepted" && i.solver === solver,
+      (i) => i.state === "accepted" && i.solver === solver && i.deadline > nowSec,
       (i) => ({ ...i, ...patch, state: "filled" }),
+    );
+  }
+
+  extendDeadlineIfAccepted(id: string, newDeadline: number, expectedVersion?: number): MutationResult {
+    return this.mutate(
+      id,
+      expectedVersion,
+      (i) => i.state === "accepted" && i.deadline < newDeadline,
+      (i) => ({ ...i, deadline: newDeadline }),
     );
   }
 

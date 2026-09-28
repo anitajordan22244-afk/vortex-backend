@@ -6,7 +6,8 @@ import { InMemoryIntentsRepository } from "./intents.repository";
 import { IntentsService, NewIntentData } from "./intents.service";
 import { IntentsGateway } from "./intents.gateway";
 import { PrismaService } from "../prisma/prisma.service";
-import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { StellarTxService } from "../soroban/stellar-tx.service";
+import { ProtocolParamsService } from "../governance/params.service";
 import {
   isRateLimited,
   SourceDepositVerificationService,
@@ -38,8 +39,11 @@ function build(enabled = true) {
   const intents = new IntentsService(
     new InMemoryIntentsRepository({ seed: false }),
     config(enabled),
-    {} as SettlementContractClient,
+    {} as StellarTxService,
     { intentAuditLog: { create: jest.fn().mockResolvedValue({}) } } as unknown as PrismaService,
+    undefined, // shadow monitor
+    undefined, // metrics
+    { snapshotForChain: () => ({ version: 0, deadlineSeconds: 1800, fillWindowSeconds: 600 }) } as unknown as ProtocolParamsService,
   );
   const verify = jest.fn<Promise<DepositCheck>, [unknown]>();
   const verifier: SourceChainVerifier = { supports: (c) => c !== "stellar", verify: verify as SourceChainVerifier["verify"] };
@@ -68,7 +72,6 @@ describe("IntentsService — initial source verification (issue #403)", () => {
     const { intents } = build(true);
     const created = await intents.create(data("base"));
     expect(created).toMatchObject({ srcVerified: false, srcVerification: { status: "pending" } });
-    intents.onModuleDestroy();
   });
 
   it("marks Stellar-source intents verified (non-EVM chains are out of scope)", async () => {
@@ -77,7 +80,6 @@ describe("IntentsService — initial source verification (issue #403)", () => {
       srcVerified: true,
       srcVerification: { status: "skipped", detail: "non-EVM source chain" },
     });
-    intents.onModuleDestroy();
   });
 
   it("marks every intent verified while the feature is disabled", async () => {
@@ -86,7 +88,6 @@ describe("IntentsService — initial source verification (issue #403)", () => {
       srcVerified: true,
       srcVerification: { status: "skipped", detail: "deposit verification disabled" },
     });
-    intents.onModuleDestroy();
   });
 });
 
@@ -95,7 +96,6 @@ describe("SourceDepositVerificationService (issue #403)", () => {
 
   afterEach(() => {
     h.service.onModuleDestroy();
-    h.intents.onModuleDestroy();
     jest.restoreAllMocks();
   });
 

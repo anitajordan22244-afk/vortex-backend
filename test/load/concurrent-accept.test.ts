@@ -143,6 +143,43 @@ describe("Concurrent accept / fill race load test", () => {
     expect(winners[0]).toMatchObject({ state: "filled", version: 2 });
   });
 
+  it("race inventory #473: accept past deadline loses even when it beats the sweeper to the write", async () => {
+    const repo = new InMemoryIntentsRepository();
+    const [open] = repo.findByState("open");
+    const pastDeadline = Math.floor(Date.now() / 1000) - 10;
+    const expired = { ...open, deadline: pastDeadline };
+    // Simulate an intent whose deadline elapsed before the accept write lands.
+    repo.save({ ...expired });
+    const now = Math.floor(Date.now() / 1000);
+    const result = await repo.acceptIfOpen(open.intentId, "SOLVER_LATE", now + 300, now);
+    expect(result).toBeNull();
+  });
+
+  it("race inventory #473: fill past the accept-extended deadline loses (sweeper slash wins)", async () => {
+    const repo = new InMemoryIntentsRepository();
+    const [open] = repo.findByState("open");
+    const now = Math.floor(Date.now() / 1000);
+    await repo.acceptIfOpen(open.intentId, "SOLVER_X", now + 1, now - 100);
+    // Advance past the fill window before the fill write lands.
+    const late = await repo.fillIfAccepted(
+      open.intentId,
+      "SOLVER_X",
+      { fillAmount: "995000", txHash: "late", filledAt: now + 60 },
+      now + 60,
+    );
+    expect(late).toBeNull();
+  });
+
+  it("race inventory #473: cancel vs accept — exactly one terminal path wins", async () => {
+    const repo = new InMemoryIntentsRepository();
+    const [open] = repo.findByState("open");
+    const now = Math.floor(Date.now() / 1000);
+    const accepted = await repo.acceptIfOpen(open.intentId, "SOLVER_RACE", now + 300, now);
+    const cancelled = await repo.cancelIfOpen(open.intentId);
+    // Exactly one of the two conditional writes may succeed.
+    expect(Number(accepted !== null) + Number(cancelled !== null)).toBeLessThanOrEqual(1);
+  });
+
   // ── Issue #405: optimistic concurrency, ETag / If-Match, zero lost updates ──
 
   describe("optimistic concurrency (issue #405)", () => {

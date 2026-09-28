@@ -1,3 +1,4 @@
+import { BadRequestException } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
 import { Keypair } from "@stellar/stellar-sdk";
 import { SorobanController } from "./soroban.controller";
@@ -124,7 +125,11 @@ describe("SorobanController", () => {
   // -------------------------------------------------------------------------
 
   describe("getAccount", () => {
-    const PUBLIC_KEY = Keypair.random().publicKey();
+    const PUBLIC_KEY = "GA6NGB7335VYC4CEHUN6KZD2NNESU36BKCL5LZCTTY6ICW5ZVII67FF4";
+    // Real strkeys (valid CRC16). A well-formed-looking "G…" string with a bad
+    // checksum is rejected by the controller, so fixtures must be genuine.
+    const PUBLIC_KEY = "GAMS2CGT4CPVYB5LSZV3FAOYFJK67574RS5HASJNTNS7WEUO3CN6ADW4";
+    const OTHER_KEY = "GCGMQIBI2B64NO4JI5IRXUOKFQYFUXBRJUUQBOHJQZA34JOKFU3W2WVK";
 
     it("passes the publicKey path param through to sorobanService.getAccount", async () => {
       const mockAccount = { id: PUBLIC_KEY, sequence: "98765" };
@@ -138,18 +143,39 @@ describe("SorobanController", () => {
     });
 
     it("passes a different publicKey correctly", async () => {
-      const anotherKey = Keypair.random().publicKey();
+      const anotherKey = "GBCI24BNYGGIRDE4PCUD6PJAQINUVQPIUJCBJT4HTZZONEXNVVDIYVAC";
       mockSorobanService.getAccount.mockResolvedValueOnce({ id: anotherKey });
+      mockSorobanService.getAccount.mockResolvedValueOnce({ id: OTHER_KEY });
 
-      await controller.getAccount(anotherKey);
+      await controller.getAccount(OTHER_KEY);
 
-      expect(mockSorobanService.getAccount).toHaveBeenCalledWith(anotherKey);
+      expect(mockSorobanService.getAccount).toHaveBeenCalledWith(OTHER_KEY);
     });
 
     it("propagates errors from sorobanService.getAccount", async () => {
       mockSorobanService.getAccount.mockRejectedValueOnce(new Error("account not found"));
 
       await expect(controller.getAccount(PUBLIC_KEY)).rejects.toThrow("account not found");
+    });
+
+    it("rejects a strkey-shaped string with an invalid checksum", () => {
+      // Same length/prefix as a real key, corrupt payload → checksum fails.
+      const badChecksum = `G${PUBLIC_KEY.slice(1, -1)}A`;
+
+      expect(() => controller.getAccount(badChecksum)).toThrow(BadRequestException);
+      expect(mockSorobanService.getAccount).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-G key such as a contract id", () => {
+      const contractId = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+
+      expect(() => controller.getAccount(contractId)).toThrow(BadRequestException);
+      expect(mockSorobanService.getAccount).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty key", () => {
+      expect(() => controller.getAccount("")).toThrow(BadRequestException);
+      expect(mockSorobanService.getAccount).not.toHaveBeenCalled();
     });
   });
 });

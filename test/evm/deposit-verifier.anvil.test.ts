@@ -29,7 +29,8 @@ import { IntentsService } from "../../src/intents/intents.service";
 import { IntentsGateway } from "../../src/intents/intents.gateway";
 import { SourceDepositVerificationService, SRC_REVERIFY_INTERVAL_MS } from "../../src/intents/source-deposit-verification.service";
 import { PrismaService } from "../../src/prisma/prisma.service";
-import { SettlementContractClient } from "../../src/soroban/contracts/settlement.client";
+import { StellarTxService } from "../../src/soroban/stellar-tx.service";
+import { ProtocolParamsService } from "../../src/governance/params.service";
 
 const ANVIL = process.env.ANVIL_PATH ?? "anvil";
 const anvilAvailable = spawnSync(ANVIL, ["--version"], { stdio: "ignore" }).status === 0;
@@ -104,8 +105,11 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
     const intents = new IntentsService(
       new InMemoryIntentsRepository({ seed: false }),
       config,
-      {} as SettlementContractClient,
+      {} as StellarTxService,
       { intentAuditLog: { create: jest.fn().mockResolvedValue({}) } } as unknown as PrismaService,
+      undefined, // shadow monitor
+      undefined, // metrics
+      { snapshotForChain: () => ({ version: 0, deadlineSeconds: 1800, fillWindowSeconds: 600 }) } as unknown as ProtocolParamsService,
     );
     const gateway = { broadcast: jest.fn().mockResolvedValue(undefined) };
     const service = new SourceDepositVerificationService(
@@ -151,7 +155,6 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
       srcVerified: true,
       srcVerification: { status: "verified", detail: "12/12 confirmations", receivedAmount: "1000000" },
     });
-    intents.onModuleDestroy();
   });
 
   it("verifies from srcTxHash via the receipt", async () => {
@@ -162,7 +165,6 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
 
     const withTx = { ...probe, srcTxHash: txHash };
     expect(await verifier().verify(withTx)).toMatchObject({ status: "verified" });
-    intents.onModuleDestroy();
   });
 
   it("rejects deposits whose amount or user does not match", async () => {
@@ -175,7 +177,6 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
 
     expect(await verifier().verify(short)).toMatchObject({ status: "mismatch", receivedAmount: "999999" });
     expect(await verifier().verify(wrongUser)).toMatchObject({ status: "mismatch", detail: expect.stringMatching(/user/) });
-    intents.onModuleDestroy();
   });
 
   it("un-verifies an intent when a reorg removes its deposit", async () => {
@@ -201,7 +202,6 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
     expect(gateway.broadcast).toHaveBeenLastCalledWith(
       expect.objectContaining({ type: "intent_src_unverified", intentId: intent.intentId, reason: "reorged" }),
     );
-    intents.onModuleDestroy();
   });
 
   it("drops back to pending when a reorg re-includes the deposit below the confirmation depth", async () => {
@@ -225,6 +225,5 @@ describeAnvil("EVM deposit verification against Anvil (issue #403)", () => {
       srcVerified: false,
       srcVerification: { status: "pending", detail: "3/12 confirmations" },
     });
-    intents.onModuleDestroy();
   });
 });

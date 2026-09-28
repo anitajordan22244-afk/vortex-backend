@@ -3,23 +3,19 @@ import { ConfigService } from "@nestjs/config";
 import { Keypair } from "@stellar/stellar-sdk";
 import { AppConfig, CHAIN_FILL_WINDOW_DEFAULTS, DEFAULT_FILL_WINDOW_SECONDS } from "../config/configuration";
 import { StellarTxService } from "../soroban/stellar-tx.service";
-import { SettlementContractClient } from "../soroban/contracts/settlement.client";
-import { ContractVersionService } from "../soroban/contract-version.service";
 import { IntentsService } from "./intents.service";
-import {
-  INTENTS_REPOSITORY,
-  InMemoryIntentsRepository,
-  MutationResult,
-  VersionConflict,
-} from "./intents.repository";
+import { INTENTS_REPOSITORY, InMemoryIntentsRepository } from "./intents.repository";
+import { PrismaService } from "../prisma/prisma.service";
+import { ProtocolParamsService } from "../governance/params.service";
+import { MutationResult, VersionConflict } from "./intents.repository";
 import { Intent } from "./intents.types";
 
-/** Narrow a MutationResult to the Intent a successful mutation returns. */
+/** Narrow a MutationResult to the Intent a successful mutation returns (issue #405). */
 function intentOf(result: MutationResult | undefined): Intent {
   if (!result || result instanceof VersionConflict) throw new Error(`expected an intent, got ${JSON.stringify(result)}`);
   return result;
 }
-import { PrismaService } from "../prisma/prisma.service";
+
 
 const VALID_CONTRACT_ID = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
 
@@ -44,18 +40,19 @@ function fakePrismaService(): PrismaService {
   } as unknown as PrismaService;
 }
 
-/**
- * Real SettlementContractClient over a fake StellarTxService, with the
- * version preflight resolving to settlement-v1 (issue #402).
- */
-function settlementClient(
-  configOverrides: { onchainIntentsEnabled?: boolean; settlementContractId?: string } = {},
-  stellarTx: jest.Mocked<StellarTxService> = fakeStellarTxService(),
-): SettlementContractClient {
-  const versions = {
-    assertWritable: jest.fn().mockResolvedValue({ abiVersion: "settlement-v1", wasmHash: "ab".repeat(32) }),
-  } as unknown as ContractVersionService;
-  return new SettlementContractClient(stellarTx, versions, fakeConfig(configOverrides));
+function fakeProtocolParamsService(): ProtocolParamsService {
+  return {
+    snapshotForChain: jest.fn().mockReturnValue({
+      version: 0,
+      feeBps: 30,
+      deadlineSeconds: 1800,
+      fillWindowSeconds: 600,
+      capturedAt: new Date().toISOString(),
+    }),
+    getCurrent: jest.fn().mockReturnValue({ version: 0, feeBps: 30, chains: {}, maxExposureRatio: 0.05, slashAmount: "100000000", activeSinceLedger: 0, adoptedAt: new Date().toISOString() }),
+    getPending: jest.fn().mockReturnValue(null),
+    getHistory: jest.fn().mockReturnValue([]),
+  } as unknown as ProtocolParamsService;
 }
 
 function makeService(
@@ -65,8 +62,9 @@ function makeService(
   return new IntentsService(
     new InMemoryIntentsRepository(),
     fakeConfig(configOverrides),
-    settlementClient(configOverrides, stellarTx),
+    stellarTx ?? fakeStellarTxService(),
     fakePrismaService(),
+    fakeProtocolParamsService(),
   );
 }
 
@@ -97,12 +95,16 @@ async function buildService(
         useValue: fakeConfig(configOverrides),
       },
       {
-        provide: SettlementContractClient,
-        useValue: settlementClient(configOverrides, stellarTxService),
+        provide: StellarTxService,
+        useValue: stellarTxService ?? fakeStellarTxService(),
       },
       {
         provide: PrismaService,
         useValue: fakePrismaService(),
+      },
+      {
+        provide: ProtocolParamsService,
+        useValue: fakeProtocolParamsService(),
       },
       IntentsService,
     ],
@@ -169,7 +171,7 @@ describe("IntentsService", () => {
 
   it("update mutates and returns the patched intent", async () => {
     const [existing] = await service.getByState("open");
-    const updated = await service.update(existing.intentId, { state: "accepted", solver: "SOLVER_X" }, existing.version);
+    const updated = await service.update(existing.intentId, { state: "accepted", solver: "SOLVER_X" }, (await service.get(existing.intentId))!.version);
 
     expect(intentOf(updated).state).toBe("accepted");
     expect(intentOf(updated).solver).toBe("SOLVER_X");
@@ -320,7 +322,7 @@ describe("IntentsService", () => {
         deadline: now + 3600,
       });
       // Manually patch to an unknown chain to exercise the fallback
-      await service.update(intent.intentId, { srcChain: "unknown_chain" as never }, intent.version);
+      await service.update(intent.intentId, { srcChain: "unknown_chain" as never }, (await service.get(intent.intentId))!.version);
 
       const result = await service.acceptIfOpen(intent.intentId, "SOLVER_X");
 
@@ -377,7 +379,7 @@ describe("IntentsService", () => {
   describe("on-chain registration (ONCHAIN_INTENTS_ENABLED)", () => {
     it("stays fully in the repository when the flag is off, never touching StellarTxService", async () => {
       const stellarTxService = fakeStellarTxService();
-      const service = makeService({ onchainIntentsEnabled: false }, stellarTxService);
+      const svc = makeService({ onchainIntentsEnabled: false }, stellarTxService);
 
       const intent = await service.create(validCreateData());
 
@@ -388,7 +390,7 @@ describe("IntentsService", () => {
     it("invokes the settlement contract and preserves the Intent shape when the flag is on", async () => {
       const stellarTxService = fakeStellarTxService();
       stellarTxService.invokeContract.mockResolvedValue({ hash: "deadbeef", status: "SUCCESS" } as never);
-      const service = makeService(
+      const svc = makeService(
         { onchainIntentsEnabled: true, settlementContractId: VALID_CONTRACT_ID },
         stellarTxService,
       );
@@ -414,9 +416,6 @@ describe("IntentsService", () => {
           state: "",
           createdAt: 0,
           deadline: 0,
-          version: 0,
-          srcVerified: true,
-          srcVerification: {},
         }).sort(),
       );
       expect(await service.get(intent.intentId)).toBeDefined();
@@ -426,6 +425,8 @@ describe("IntentsService", () => {
       const stellarTxService = fakeStellarTxService();
       const service = makeService({ onchainIntentsEnabled: true }, stellarTxService);
       const before = (await service.getAll()).length;
+      const svc = makeService({ onchainIntentsEnabled: true }, stellarTxService);
+      const before = (await svc.getAll()).length;
 
       await expect(service.create(validCreateData())).rejects.toMatchObject({
         message: expect.stringContaining("SETTLEMENT_CONTRACT_ID"),
@@ -437,7 +438,7 @@ describe("IntentsService", () => {
     it("rejects and does not create the intent when the on-chain call fails", async () => {
       const stellarTxService = fakeStellarTxService();
       stellarTxService.invokeContract.mockRejectedValue(new Error("submission failed after 5 attempts"));
-      const service = makeService(
+      const svc = makeService(
         { onchainIntentsEnabled: true, settlementContractId: VALID_CONTRACT_ID },
         stellarTxService,
       );
@@ -506,7 +507,7 @@ describe("IntentsService", () => {
           findMany: jest.fn().mockResolvedValue([]),
         },
       } as unknown as PrismaService;
-      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), settlementClient(), prismaService);
+      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), fakeStellarTxService(), prismaService, fakeProtocolParamsService());
 
       svc.appendAuditEntry("intent-db", "slashed", "system", "missed fill", { foo: "bar" });
 
@@ -535,7 +536,7 @@ describe("IntentsService", () => {
           findMany: jest.fn().mockResolvedValue([]),
         },
       } as unknown as PrismaService;
-      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), settlementClient(), prismaService);
+      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), fakeStellarTxService(), prismaService, fakeProtocolParamsService());
 
       // Should not throw synchronously
       expect(() =>
