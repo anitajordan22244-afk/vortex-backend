@@ -1,6 +1,5 @@
 import { BadRequestException } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
-import { Keypair } from "@stellar/stellar-sdk";
 import { SorobanController } from "./soroban.controller";
 import { SorobanService } from "./soroban.service";
 import { ContractVersionService } from "./contract-version.service";

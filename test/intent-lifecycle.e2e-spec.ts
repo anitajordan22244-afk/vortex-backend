@@ -19,7 +19,6 @@ import {
   buildCancelMessage,
   buildFillMessage,
 } from "../src/common/stellar-signature";
-import { Intent } from "../src/intents/intents.types";
 
 const ALPHA_KP = SEED_SOLVER_KEYPAIRS.ALPHA;
 const BETA_KP = SEED_SOLVER_KEYPAIRS.BETA;

@@ -19,8 +19,6 @@ ALTER TABLE IF EXISTS "intents"
     ADD COLUMN IF NOT EXISTS "src_tx_hash"      TEXT,
     ADD COLUMN IF NOT EXISTS "src_verification" JSONB;
 
--- squawk-ignore create-index-without-concurrently
--- justification: Prisma runs each migration in a transaction, which forbids CONCURRENTLY. The index is partial (open, verified intents only), so it is small; on very large tables pre-create it CONCURRENTLY out of band and IF NOT EXISTS makes this a no-op.
 DO $$
 BEGIN
     IF to_regclass('intents') IS NOT NULL THEN
@@ -34,6 +32,8 @@ BEGIN
         WHERE "src_verification" IS NULL;
 
         -- GET /intents/open and the solver WS snapshot read exactly this slice.
+        -- squawk-ignore create-index-without-concurrently
+        -- justification: Prisma runs each migration in a transaction, which forbids CONCURRENTLY. The index is partial (open, verified intents only), so it is small; on very large tables pre-create it CONCURRENTLY out of band and IF NOT EXISTS makes this a no-op.
         CREATE INDEX IF NOT EXISTS "intents_open_verified_idx"
             ON "intents" ("created_at" DESC)
             WHERE "state" = 'open' AND "src_verified";
