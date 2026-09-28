@@ -7,7 +7,6 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { v4 as uuidv4 } from "uuid";
-import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { Intent, IntentAuditEntry, IntentState } from "./intents.types";
 import {
   INTENTS_REPOSITORY,
@@ -23,7 +22,8 @@ import {
   CHAIN_FILL_WINDOW_DEFAULTS,
   DEFAULT_FILL_WINDOW_SECONDS,
 } from "../config/configuration";
-import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { ContractVersionUnsupportedException } from "../soroban/contract-version.service";
 import { PrismaService } from "../prisma/prisma.service";
 
 const STORE_SIZE_LOG_INTERVAL_MS = 60_000;
@@ -96,7 +96,7 @@ export class IntentsService implements OnModuleDestroy {
     @Inject(INTENTS_REPOSITORY)
     private readonly repo: IIntentsRepository,
     private readonly configService: ConfigService<AppConfig, true>,
-    private readonly stellarTxService: StellarTxService,
+    private readonly settlement: SettlementContractClient,
     private readonly prisma: PrismaService,
   ) {
     const sweepMs = Number(this.configService.get("intentRetentionSweepMs", { infer: true }) ?? STORE_SIZE_LOG_INTERVAL_MS);
@@ -223,25 +223,23 @@ export class IntentsService implements OnModuleDestroy {
 
   /**
    * Registers `intent` with the settlement contract. Only called when
-   * ONCHAIN_INTENTS_ENABLED is on; while that flag is off, create() stays
-   * fully in-memory (the rollout fallback).
+   * ONCHAIN_INTENTS_ENABLED is on; while that flag is off, create() never
+   * touches the chain (the rollout fallback). The settlement client gates the
+   * call on the deployed contract version (issue #402).
    */
   private async registerOnChain(intent: Intent): Promise<void> {
-    const contractId = this.configService.get("stellar.settlementContractId", { infer: true });
-    if (!contractId) {
+    if (!this.settlement.contractId) {
       throw new ServiceUnavailableException(
         "On-chain intent registration is enabled but SETTLEMENT_CONTRACT_ID is not configured",
       );
     }
 
     try {
-      const result = await this.stellarTxService.invokeContract({
-        contractId,
-        method: "create_intent",
-        args: this.buildCreateIntentArgs(intent),
-      });
+      const result = await this.settlement.createIntent(intent);
       this.logger.log(`Registered intent ${intent.intentId} on-chain (tx ${result.hash})`);
     } catch (err) {
+      // Read-only mode: surface the version details rather than a generic error.
+      if (err instanceof ContractVersionUnsupportedException) throw err;
       this.logger.error(
         `Failed to register intent ${intent.intentId} on-chain: ${(err as Error).message}`,
       );
@@ -249,19 +247,6 @@ export class IntentsService implements OnModuleDestroy {
         "Failed to register intent with the settlement contract",
       );
     }
-  }
-
-  private buildCreateIntentArgs(intent: Intent): xdr.ScVal[] {
-    return [
-      nativeToScVal(intent.intentId, { type: "string" }),
-      new Address(intent.user).toScVal(),
-      nativeToScVal(intent.srcChain, { type: "symbol" }),
-      nativeToScVal(intent.srcToken.address, { type: "string" }),
-      nativeToScVal(BigInt(intent.srcAmount), { type: "i128" }),
-      new Address(intent.dstToken.contract).toScVal(),
-      nativeToScVal(BigInt(intent.minDstAmount), { type: "i128" }),
-      nativeToScVal(intent.deadline, { type: "u64" }),
-    ];
   }
 
   async get(id: string): Promise<Intent | undefined> {

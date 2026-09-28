@@ -28,6 +28,11 @@ export class MetricsService implements OnModuleInit {
   public readonly intentsStoreMismatchesTotal: client.Counter<string>;
   public readonly intentsStoreVerifierRunsTotal: client.Counter<string>;
 
+  /** Contract version gating metrics (issue #402). */
+  public readonly contractVersionSupported: client.Gauge<string>;
+  public readonly contractUpgradesTotal: client.Counter<string>;
+  public readonly contractWritesBlockedTotal: client.Counter<string>;
+
   constructor(private readonly configService: ConfigService<AppConfig, true>) {
     this.register = new client.Registry();
     const prefix = "vortex_";
@@ -113,6 +118,28 @@ export class MetricsService implements OnModuleInit {
       help: "Completed dual-write consistency verifier runs",
       registers: [this.register],
     });
+
+    // ── Contract version gating (issue #402) ─────────────────────────────────
+    this.contractVersionSupported = new client.Gauge({
+      name: `${prefix}contract_version_supported`,
+      help: "1 when the deployed contract WASM maps to a supported ABI, 0 when writes are blocked",
+      labelNames: ["contract"],
+      registers: [this.register],
+    });
+
+    this.contractUpgradesTotal = new client.Counter({
+      name: `${prefix}contract_upgrades_total`,
+      help: "Contract WASM upgrades detected, by detection source (poll | event)",
+      labelNames: ["contract", "source"],
+      registers: [this.register],
+    });
+
+    this.contractWritesBlockedTotal = new client.Counter({
+      name: `${prefix}contract_writes_blocked_total`,
+      help: "On-chain writes refused because the contract version is unsupported",
+      labelNames: ["contract"],
+      registers: [this.register],
+    });
   }
 
   onModuleInit() {
@@ -161,5 +188,17 @@ export class MetricsService implements OnModuleInit {
       this.intentsStoreMismatches.set({ kind }, count);
       if (count > 0) this.intentsStoreMismatchesTotal.inc({ kind }, count);
     }
+  }
+
+  setContractVersionSupported(contract: string, supported: boolean): void {
+    this.contractVersionSupported.set({ contract }, supported ? 1 : 0);
+  }
+
+  recordContractUpgrade(contract: string, source: "poll" | "event"): void {
+    this.contractUpgradesTotal.inc({ contract, source });
+  }
+
+  recordContractWriteBlocked(contract: string): void {
+    this.contractWritesBlockedTotal.inc({ contract });
   }
 }

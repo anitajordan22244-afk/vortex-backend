@@ -1,10 +1,17 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { Injectable, OnModuleDestroy, OnModuleInit, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { scValToNative, SorobanRpc } from "@stellar/stellar-sdk";
 import { AppConfig } from "../config/configuration";
 import { logger } from "../common/logger";
 import { SorobanService } from "./soroban.service";
 import { SolversService } from "../solvers/solvers.service";
+import { ContractVersionService } from "./contract-version.service";
+
+/**
+ * Topic names a contract may use to announce a WASM upgrade (issue #402).
+ * Soroban has no standard upgrade event, so accept the common spellings.
+ */
+export const CONTRACT_UPGRADE_EVENT_NAMES = new Set(["upgrade", "upgraded", "contract_upgraded"]);
 
 const POLL_INTERVAL_MS = 10_000;
 const RECONCILE_INTERVAL_MS = 60_000;
@@ -47,6 +54,7 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
     private readonly sorobanService: SorobanService,
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly solversService: SolversService,
+    @Optional() private readonly contractVersions?: ContractVersionService,
   ) {}
 
   onModuleInit() {
@@ -71,6 +79,9 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
   async poll(): Promise<void> {
     const settlementContractId = this.configService.get("stellar.settlementContractId", { infer: true });
     if (!settlementContractId) return;
+    // The solver registry is watched too, for its upgrade events (issue #402).
+    const registryContractId = this.configService.get("stellar.solverRegistryContractId", { infer: true });
+    const contractIds = [settlementContractId, ...(registryContractId ? [registryContractId] : [])];
 
     let startLedger = this.nextStartLedger;
     if (startLedger === undefined) {
@@ -80,7 +91,7 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
 
     const response = await this.sorobanService.getEvents({
       startLedger,
-      filters: [{ type: "contract", contractIds: [settlementContractId] }],
+      filters: [{ type: "contract", contractIds }],
     });
 
     for (const event of response.events) {
@@ -129,6 +140,8 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
     const eventName = typeof topic[0] === "string" ? topic[0] : undefined;
     if (eventName === "intent_filled") {
       this.handleIntentFilled(event, topic);
+    } else if (eventName && CONTRACT_UPGRADE_EVENT_NAMES.has(eventName)) {
+      this.handleContractUpgraded(event, topic);
     } else if (eventName === "solver_slashed") {
       // Fire-and-forget: penalty confirmation is non-blocking relative to
       // ingestion — a reconciliation failure is logged but never stalls the
@@ -150,6 +163,36 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
     logger.info(
       `[event-ingestion] intent_filled event at ledger=${event.ledger} txHash=${event.txHash} topic=${JSON.stringify(topic)}`,
     );
+  }
+
+  /**
+   * A tracked contract announced a WASM upgrade: hand it to
+   * ContractVersionService, which records the history row and re-checks the
+   * hash immediately so writes are gated before the next attempt.
+   * Topic layout tolerated: [name] or [name, newWasmHash (bytes | hex string)].
+   */
+  private handleContractUpgraded(event: SorobanRpc.Api.EventResponse, topic: unknown[]): void {
+    const contractId = event.contractId?.toString();
+    if (!contractId || !this.contractVersions) return;
+    const rawHash = topic[1] ?? (() => {
+      try {
+        return scValToNative(event.value);
+      } catch {
+        return undefined;
+      }
+    })();
+    // scValToNative yields a Buffer or a bare Uint8Array for BytesN.
+    const wasmHash = rawHash instanceof Uint8Array
+      ? Buffer.from(rawHash).toString("hex")
+      : typeof rawHash === "string" && /^[0-9a-f]{64}$/i.test(rawHash)
+        ? rawHash.toLowerCase()
+        : undefined;
+
+    this.contractVersions
+      .recordUpgradeEvent({ contractId, ledger: event.ledger, txHash: event.txHash, wasmHash })
+      .catch((err) =>
+        logger.error(`[event-ingestion] contract upgrade handling failed at ledger=${event.ledger}: ${(err as Error).message}`),
+      );
   }
 
   private async reconcileStaleIntents(): Promise<void> {

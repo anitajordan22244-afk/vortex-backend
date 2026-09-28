@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { ApiTags } from "@nestjs/swagger";
 import { AppConfig } from "../config/configuration";
 import { DatabaseHealthService } from "./database-health.service";
+import { ContractVersionService } from "../soroban/contract-version.service";
 
 @ApiTags("health")
 @Controller("health")
@@ -10,6 +11,7 @@ export class HealthController {
   constructor(
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly dbHealth: DatabaseHealthService,
+    private readonly contractVersions: ContractVersionService,
   ) {}
 
   @Get("live")
@@ -34,6 +36,9 @@ export class HealthController {
       network: `stellar-${this.configService.get("stellar.network", { infer: true })}`,
       uptime: process.uptime(),
       db,
+      // Issue #402: read-only when a configured contract's WASM hash is not
+      // on a supported ABI. Reads keep working, so this does not fail the probe.
+      ...this.contractVersions.snapshot(),
     };
   }
 
@@ -48,6 +53,9 @@ export class HealthController {
       network: `stellar-${this.configService.get("stellar.network", { infer: true })}`,
       uptime: process.uptime(),
       db,
+      // Issue #402: read-only when a configured contract's WASM hash is not
+      // on a supported ABI. Reads keep working, so this does not fail the probe.
+      ...this.contractVersions.snapshot(),
     };
   }
 }

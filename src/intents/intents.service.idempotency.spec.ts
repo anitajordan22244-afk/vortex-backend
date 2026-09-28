@@ -3,7 +3,7 @@ import { IntentsService, NewIntentData } from "./intents.service";
 import { IIntentsRepository } from "./intents.repository";
 import { Intent } from "./intents.types";
 import { AppConfig } from "../config/configuration";
-import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
 import { PrismaService } from "../prisma/prisma.service";
 
 /**
@@ -91,7 +91,7 @@ function buildService(onchain = false): Harness {
     },
   } as unknown as ConfigService<AppConfig, true>;
 
-  const stellarTx = {} as unknown as StellarTxService;
+  const stellarTx = { contractId: "CONTRACT" } as unknown as SettlementContractClient;
   const prisma = {} as unknown as PrismaService;
 
   const service = new IntentsService(

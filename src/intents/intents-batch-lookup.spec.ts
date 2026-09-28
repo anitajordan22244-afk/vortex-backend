@@ -1,7 +1,7 @@
 import { ConfigService } from "@nestjs/config";
 import { IntentsService } from "./intents.service";
 import { InMemoryIntentsRepository } from "./intents.repository";
-import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
 import { PrismaService } from "../prisma/prisma.service";
 import { AppConfig } from "../config/configuration";
 
@@ -15,7 +15,7 @@ describe("IntentsService.getMany (#275)", () => {
     const config = {
       get: jest.fn().mockReturnValue(false),
     } as unknown as ConfigService<AppConfig, true>;
-    const stellarTx = {} as StellarTxService;
+    const stellarTx = {} as SettlementContractClient;
     const prisma = {
       intentAuditLog: { create: jest.fn().mockResolvedValue({}) },
     } as unknown as PrismaService;

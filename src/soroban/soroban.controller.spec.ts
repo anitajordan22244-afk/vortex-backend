@@ -1,6 +1,8 @@
 import { Test, TestingModule } from "@nestjs/testing";
+import { Keypair } from "@stellar/stellar-sdk";
 import { SorobanController } from "./soroban.controller";
 import { SorobanService } from "./soroban.service";
+import { ContractVersionService } from "./contract-version.service";
 
 // ---------------------------------------------------------------------------
 // Mock SorobanService — we only want to verify the controller wires correctly.
@@ -12,6 +14,15 @@ const mockSorobanService = {
   getNetwork: jest.fn(),
   getAccount: jest.fn(),
 };
+
+const VERSION_SNAPSHOT = {
+  readOnly: true,
+  contracts: {
+    settlement: { contract: "settlement", contractId: "C1", status: "unknown_hash", wasmHash: "ff" },
+    solverRegistry: { contract: "solverRegistry", contractId: "", status: "unconfigured" },
+  },
+};
+const mockContractVersions = { snapshot: jest.fn(() => VERSION_SNAPSHOT) };
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -25,7 +36,10 @@ describe("SorobanController", () => {
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [SorobanController],
-      providers: [{ provide: SorobanService, useValue: mockSorobanService }],
+      providers: [
+        { provide: SorobanService, useValue: mockSorobanService },
+        { provide: ContractVersionService, useValue: mockContractVersions },
+      ],
     }).compile();
 
     controller = module.get(SorobanController);
@@ -88,14 +102,14 @@ describe("SorobanController", () => {
   // -------------------------------------------------------------------------
 
   describe("getNetwork", () => {
-    it("calls sorobanService.getNetwork and returns its result", async () => {
+    it("returns the RPC network info plus contract version state (#402)", async () => {
       const mockResult = { passphrase: "Test SDF Network ; September 2015" };
       mockSorobanService.getNetwork.mockResolvedValueOnce(mockResult);
 
       const result = await controller.getNetwork();
 
       expect(mockSorobanService.getNetwork).toHaveBeenCalledTimes(1);
-      expect(result).toEqual(mockResult);
+      expect(result).toEqual({ ...mockResult, ...VERSION_SNAPSHOT });
     });
 
     it("propagates errors from sorobanService.getNetwork", async () => {
@@ -110,7 +124,7 @@ describe("SorobanController", () => {
   // -------------------------------------------------------------------------
 
   describe("getAccount", () => {
-    const PUBLIC_KEY = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+    const PUBLIC_KEY = Keypair.random().publicKey();
 
     it("passes the publicKey path param through to sorobanService.getAccount", async () => {
       const mockAccount = { id: PUBLIC_KEY, sequence: "98765" };
@@ -124,7 +138,7 @@ describe("SorobanController", () => {
     });
 
     it("passes a different publicKey correctly", async () => {
-      const anotherKey = "GBVVJJLE2VF7VKUQM7FXKCOQMHJZYJFXBSRH3DPHQHVJQCLJTPB65CG";
+      const anotherKey = Keypair.random().publicKey();
       mockSorobanService.getAccount.mockResolvedValueOnce({ id: anotherKey });
 
       await controller.getAccount(anotherKey);

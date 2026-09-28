@@ -137,6 +137,30 @@ model IntentAuditLog {
   @@map("intent_audit_log")
 }
 
+// ─── ContractUpgrade ─────────────────────────────────────────────────────────
+// Append-only history of detected WASM upgrades of the contracts the backend
+// writes to (issue #402). Written by ContractVersionService when a poll sees
+// a new hash or an upgrade event is ingested.
+
+model ContractUpgrade {
+  id               BigInt   @id @default(autoincrement()) @map("id")
+  /// "settlement" | "solverRegistry"
+  contractName     String   @map("contract_name")
+  contractId       String   @map("contract_id")
+  previousWasmHash String?  @map("previous_wasm_hash")
+  wasmHash         String?  @map("wasm_hash")
+  /// ABI version the new hash maps to; null when unsupported.
+  abiVersion       String?  @map("abi_version")
+  /// "poll" | "event"
+  source           String   @map("source")
+  ledger           Int?     @map("ledger")
+  txHash           String?  @map("tx_hash")
+  detectedAt       DateTime @default(now()) @map("detected_at") @db.Timestamptz
+
+  @@index([contractId, detectedAt], name: "contract_upgrades_contract_idx")
+  @@map("contract_upgrades")
+}
+
 // ─── Token ───────────────────────────────────────────────────────────────────
 // Static registry of tokens the protocol supports.
 // Kept separate so it can be updated without migrations when the token list changes.

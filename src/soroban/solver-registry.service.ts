@@ -1,17 +1,17 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import {
-  Address,
   BASE_FEE,
   Contract,
   Keypair,
   Networks,
   SorobanRpc,
   TransactionBuilder,
-  nativeToScVal,
 } from "@stellar/stellar-sdk";
 import { AppConfig } from "../config/configuration";
 import { SignerService } from "./signer.service";
+import { ContractVersionService, ContractVersionUnsupportedException } from "./contract-version.service";
+import { SOLVER_REGISTRY_CODECS } from "./contracts/solver-registry.client";
 
 const NETWORK_PASSPHRASE: Record<AppConfig["stellar"]["network"], string> = {
   testnet: Networks.TESTNET,
@@ -67,7 +67,8 @@ export class SolverRegistryService {
 
   constructor(
     configService: ConfigService<AppConfig, true>,
-    private readonly signerService?: SignerService,
+    @Optional() private readonly signerService?: SignerService,
+    @Optional() private readonly contractVersions?: ContractVersionService,
   ) {
     this.contractId = configService.get("stellar.solverRegistryContractId", { infer: true });
     this.signingKey = configService.get("stellar.signingKey", { infer: true });
@@ -110,6 +111,25 @@ export class SolverRegistryService {
       return { submitted: false, simulated: false, dryRun: false, detail };
     }
 
+    // Version preflight (issue #402): encode with the codec for the deployed
+    // ABI, or refuse — never throw, the sweeper must keep sweeping.
+    let codec = SOLVER_REGISTRY_CODECS["solver-registry-v1"];
+    if (this.contractVersions) {
+      try {
+        const { abiVersion } = await this.contractVersions.assertWritable("solverRegistry");
+        codec = SOLVER_REGISTRY_CODECS[abiVersion];
+      } catch (err) {
+        if (!(err instanceof ContractVersionUnsupportedException)) throw err;
+        const detail =
+          `solver-registry contract version not supported (${err.state.status}` +
+          `${err.state.wasmHash ? `, wasmHash=${err.state.wasmHash}` : ""}) — read-only mode, slash not submitted`;
+        this.logger.error(
+          `[solver-registry] blocked slash for solver=${params.solverAddress} intent=${params.intentId}: ${detail}`,
+        );
+        return { submitted: false, simulated: false, dryRun: false, detail };
+      }
+    }
+
     try {
       const sourceKeypair = this.signerService
         ? Keypair.fromSecret(this.signingKey)
@@ -117,11 +137,8 @@ export class SolverRegistryService {
       const account = await this.server.getAccount(sourceKeypair.publicKey());
       const contract = new Contract(this.contractId);
 
-      const operation = contract.call(
-        "slash",
-        Address.fromString(params.solverAddress).toScVal(),
-        nativeToScVal(params.intentId, { type: "string" }),
-      );
+      const { method, args } = codec.slash(params.solverAddress, params.intentId);
+      const operation = contract.call(method, ...args);
 
       const tx = new TransactionBuilder(account, {
         fee: BASE_FEE,

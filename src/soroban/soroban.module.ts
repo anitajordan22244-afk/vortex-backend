@@ -6,6 +6,9 @@ import { SolverRegistryService } from "./solver-registry.service";
 import { SignerService } from "./signer.service";
 import { StellarTxService } from "./stellar-tx.service";
 import { SolversModule } from "../solvers/solvers.module";
+import { ContractVersionService } from "./contract-version.service";
+import { SettlementContractClient } from "./contracts/settlement.client";
+import { CONTRACT_VERSION_REGISTRY, SUPPORTED_CONTRACT_VERSIONS } from "./contracts/contract-versions";
 
 @Module({
   // EventIngestionService needs SolversService; SolversModule → IntentsModule →
@@ -18,8 +21,13 @@ import { SolversModule } from "../solvers/solvers.module";
     SignerService,
     StellarTxService,
     EventIngestionService,
+    { provide: CONTRACT_VERSION_REGISTRY, useValue: SUPPORTED_CONTRACT_VERSIONS },
+    ContractVersionService,
+    SettlementContractClient,
   ],
   exports: [
+    ContractVersionService,
+    SettlementContractClient,
     SorobanService,
     SolverRegistryService,
     SignerService,

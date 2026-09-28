@@ -2,7 +2,7 @@ import { ConfigService } from "@nestjs/config";
 import { Keypair } from "@stellar/stellar-sdk";
 import { IntentsGateway, EventRingBuffer } from "./intents.gateway";
 import { IntentsService } from "./intents.service";
-import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
 import { PrismaService } from "../prisma/prisma.service";
 import { AppConfig } from "../config/configuration";
 import { InMemoryIntentsRepository } from "./intents.repository";
@@ -32,7 +32,7 @@ function makeIntentsService(): IntentsService {
   return new IntentsService(
     repo,
     configService,
-    {} as StellarTxService,
+    {} as SettlementContractClient,
     prismaService,
   );
 }

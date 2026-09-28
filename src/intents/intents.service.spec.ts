@@ -3,6 +3,8 @@ import { ConfigService } from "@nestjs/config";
 import { Keypair } from "@stellar/stellar-sdk";
 import { AppConfig, CHAIN_FILL_WINDOW_DEFAULTS, DEFAULT_FILL_WINDOW_SECONDS } from "../config/configuration";
 import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
+import { ContractVersionService } from "../soroban/contract-version.service";
 import { IntentsService } from "./intents.service";
 import {
   INTENTS_REPOSITORY,
@@ -42,6 +44,20 @@ function fakePrismaService(): PrismaService {
   } as unknown as PrismaService;
 }
 
+/**
+ * Real SettlementContractClient over a fake StellarTxService, with the
+ * version preflight resolving to settlement-v1 (issue #402).
+ */
+function settlementClient(
+  configOverrides: { onchainIntentsEnabled?: boolean; settlementContractId?: string } = {},
+  stellarTx: jest.Mocked<StellarTxService> = fakeStellarTxService(),
+): SettlementContractClient {
+  const versions = {
+    assertWritable: jest.fn().mockResolvedValue({ abiVersion: "settlement-v1", wasmHash: "ab".repeat(32) }),
+  } as unknown as ContractVersionService;
+  return new SettlementContractClient(stellarTx, versions, fakeConfig(configOverrides));
+}
+
 function makeService(
   configOverrides: { onchainIntentsEnabled?: boolean; settlementContractId?: string } = {},
   stellarTx?: jest.Mocked<StellarTxService>,
@@ -49,7 +65,7 @@ function makeService(
   return new IntentsService(
     new InMemoryIntentsRepository(),
     fakeConfig(configOverrides),
-    stellarTx ?? fakeStellarTxService(),
+    settlementClient(configOverrides, stellarTx),
     fakePrismaService(),
   );
 }
@@ -81,8 +97,8 @@ async function buildService(
         useValue: fakeConfig(configOverrides),
       },
       {
-        provide: StellarTxService,
-        useValue: stellarTxService ?? fakeStellarTxService(),
+        provide: SettlementContractClient,
+        useValue: settlementClient(configOverrides, stellarTxService),
       },
       {
         provide: PrismaService,
@@ -489,7 +505,7 @@ describe("IntentsService", () => {
           findMany: jest.fn().mockResolvedValue([]),
         },
       } as unknown as PrismaService;
-      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), fakeStellarTxService(), prismaService);
+      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), settlementClient(), prismaService);
 
       svc.appendAuditEntry("intent-db", "slashed", "system", "missed fill", { foo: "bar" });
 
@@ -518,7 +534,7 @@ describe("IntentsService", () => {
           findMany: jest.fn().mockResolvedValue([]),
         },
       } as unknown as PrismaService;
-      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), fakeStellarTxService(), prismaService);
+      const svc = new IntentsService(new InMemoryIntentsRepository(), fakeConfig(), settlementClient(), prismaService);
 
       // Should not throw synchronously
       expect(() =>

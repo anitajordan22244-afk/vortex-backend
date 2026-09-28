@@ -10,7 +10,7 @@ import { MetricsService } from "../metrics/metrics.service";
 import { InMemorySolversRepository } from "../solvers/in-memory-solvers.repository";
 import { SOLVERS_REPOSITORY } from "../solvers/solvers.repository";
 import { InMemoryIntentsRepository } from "./intents.repository";
-import { StellarTxService } from "../soroban/stellar-tx.service";
+import { SettlementContractClient } from "../soroban/contracts/settlement.client";
 import { PrismaService } from "../prisma/prisma.service";
 import { AppConfig } from "../config/configuration";
 
@@ -22,7 +22,7 @@ function buildIntentsService(): IntentsService {
   const configService = {
     get: jest.fn().mockReturnValue(false),
   } as unknown as ConfigService<AppConfig, true>;
-  const stellarTxService = {} as StellarTxService;
+  const stellarTxService = {} as SettlementContractClient;
   const prismaService = {
     intentAuditLog: {
       create: jest.fn().mockResolvedValue({}),

@@ -1,3 +1,6 @@
+import { ContractVersionService, ContractVersionUnsupportedException } from "./contract-version.service";
+import { SOLVER_REGISTRY_CODECS } from "./contracts/solver-registry.client";
+import { Keypair, scValToNative } from "@stellar/stellar-sdk";
 import { ConfigService } from "@nestjs/config";
 import { SolverRegistryService } from "./solver-registry.service";
 import { AppConfig } from "../config/configuration";
@@ -109,5 +112,49 @@ describe("SolverRegistryService — dry-run flag (#260)", () => {
     expect(result.submitted).toBe(false);
     expect(result.dryRun).toBe(false);
     expect(result.detail).toMatch(/not configured/i);
+  });
+});
+
+// ── #402: contract version gating ────────────────────────────────────────────
+
+describe("SolverRegistryService — contract version gating (#402)", () => {
+  const live = () =>
+    makeConfigService(
+      { solverRegistryContractId: "CTEST123", signingKey: Keypair.random().secret() },
+      { onchainDryRun: false },
+    );
+
+  it("refuses to slash — without touching the network — when the registry version is unsupported", async () => {
+    const state = { contract: "solverRegistry", contractId: "CTEST123", status: "unknown_hash", wasmHash: "ff".repeat(32) };
+    const versions = {
+      assertWritable: jest.fn().mockRejectedValue(new ContractVersionUnsupportedException(state as never)),
+    } as unknown as ContractVersionService;
+    const service = new SolverRegistryService(live(), undefined, versions);
+    const getAccount = jest.spyOn((service as unknown as { server: { getAccount: () => unknown } }).server, "getAccount");
+
+    const result = await service.slashSolver({ solverAddress: Keypair.random().publicKey(), intentId: "i-1", reason: "r" });
+
+    expect(result).toMatchObject({ submitted: false, simulated: false, dryRun: false });
+    expect(result.detail).toMatch(/version not supported \(unknown_hash, wasmHash=f{64}\)/);
+    expect(getAccount).not.toHaveBeenCalled();
+  });
+
+  it("does not consult the version in dry-run mode", async () => {
+    const versions = { assertWritable: jest.fn() } as unknown as ContractVersionService;
+    const service = new SolverRegistryService(
+      makeConfigService({ solverRegistryContractId: "CTEST123", signingKey: "S" + "A".repeat(55) }, { onchainDryRun: true }),
+      undefined,
+      versions,
+    );
+    await service.slashSolver({ solverAddress: "G", intentId: "i", reason: "r" });
+    expect(versions.assertWritable).not.toHaveBeenCalled();
+  });
+
+  it("encodes the slash call with the codec for the deployed ABI", () => {
+    const solver = Keypair.random().publicKey();
+    const { method, args } = SOLVER_REGISTRY_CODECS["solver-registry-v1"].slash(solver, "intent-9");
+    expect(method).toBe("slash");
+    expect(scValToNative(args[0])).toBe(solver);
+    expect(scValToNative(args[1])).toBe("intent-9");
   });
 });
